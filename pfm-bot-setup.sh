@@ -7,6 +7,7 @@ CONFIG_DIR="/etc/pfm-bot"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 BOT_SCRIPT="/usr/local/bin/pfm-bot"
 SERVICE_FILE="/etc/systemd/system/pfm-bot.service"
+REPO_RAW="https://raw.githubusercontent.com/SadraHimself/PFM/main"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
 W='\033[1;37m'; GR='\033[0;90m'; NC='\033[0m'; B='\033[1m'
@@ -51,12 +52,35 @@ get_admin() { py_get "print(cfg.get('admin_id',0))"; }
 get_server_count() { py_get "print(len(cfg.get('servers',[])))"; }
 
 # ─── Bot service ───
+# Returns 0 on success, 1 if the bot script could not be obtained.
 setup_service() {
     local script_dir=$(dirname "$(readlink -f "$0")")
+    local found=""
+
+    # 1) Try to find pfm-bot.py locally (normal "git clone" install)
     for loc in "$script_dir/pfm-bot.py" "./pfm-bot.py" "/root/pfm-bot.py"; do
-        [[ -f "$loc" ]] && { cp "$loc" "$BOT_SCRIPT"; break; }
+        [[ -f "$loc" ]] && { cp "$loc" "$BOT_SCRIPT"; found=1; break; }
     done
-    chmod +x "$BOT_SCRIPT" 2>/dev/null
+
+    # 2) Fallback: piped install (bash <(curl ...)) — pull pfm-bot.py from GitHub
+    if [[ -z "$found" ]]; then
+        echo -ne "  ${GR}Fetching pfm-bot.py from GitHub...${NC} "
+        if curl -fsSL "$REPO_RAW/pfm-bot.py" -o "$BOT_SCRIPT"; then
+            echo -e "${G}OK${NC}"
+        else
+            echo -e "${R}Download failed!${NC}"
+            echo -e "  ${GR}Check your internet/DNS and try again.${NC}"
+            return 1
+        fi
+    fi
+
+    # Sanity check: make sure the file actually has content
+    if [[ ! -s "$BOT_SCRIPT" ]]; then
+        echo -e "  ${R}Bot script is empty — aborting.${NC}"
+        return 1
+    fi
+
+    chmod +x "$BOT_SCRIPT"
 
     if [[ ! -f "$SERVICE_FILE" ]]; then
         cat > "$SERVICE_FILE" << EOF
@@ -64,6 +88,8 @@ setup_service() {
 Description=PFM Telegram Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -79,6 +105,7 @@ EOF
         systemctl daemon-reload
         systemctl enable pfm-bot > /dev/null 2>&1
     fi
+    return 0
 }
 
 bot_status() {
@@ -120,7 +147,10 @@ menu_setup() {
 
     # Step 3: Start bot
     echo ""
-    setup_service
+    if ! setup_service; then
+        echo -e "  ${R}Bot setup failed — service not started.${NC}"
+        sleep 3; return
+    fi
     systemctl restart pfm-bot
     sleep 1
 
