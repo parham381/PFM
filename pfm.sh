@@ -23,6 +23,9 @@ REALM_DIR="$PFM_DIR/realm"
 REALM_BIN="/usr/local/bin/realm"
 HAPROXY_CFG="$PFM_DIR/haproxy.cfg"
 LOG_FILE="/var/log/pfm.log"
+# If you fork this repo, change this to your own raw URL so `pfm install`
+# (which also runs on self-update) fetches YOUR version, not upstream.
+PFM_REPO_RAW="https://raw.githubusercontent.com/parham381/PFM/main"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
 W='\033[1;37m'; GR='\033[0;90m'; NC='\033[0m'; B='\033[1m'
@@ -43,6 +46,9 @@ human_bytes() {
 gb_to_bytes() { awk "BEGIN{printf \"%.0f\",$1*1000000000}"; }
 is_ipv6() { [[ "$1" == *:* ]]; }
 ipt() { is_ipv6 "$1" && echo "ip6tables" || echo "iptables"; }
+# Build an ip:port (or [ipv6]:port) string for --to-destination. IPv6 needs brackets
+# or the port gets silently absorbed into the address by iptables.
+nat_dest() { is_ipv6 "$1" && echo "[$1]:$2" || echo "$1:$2"; }
 
 # ═══════════════ REALM ═══════════════
 realm_installed() { [[ -x "$REALM_BIN" ]]; }
@@ -71,7 +77,7 @@ install_realm() {
 realm_conf() { echo "$REALM_DIR/${1}.toml"; }
 realm_svc() { echo "pfm-realm-${1}"; }
 create_realm_service() {
-    local port="$1" dest="$2"; mkdir -p "$REALM_DIR"
+    local port="$1" dest="$2"; local dport="${3:-$port}"; mkdir -p "$REALM_DIR"
     cat > "$(realm_conf "$port")" << EOF
 [network]
 no_tcp = false
@@ -79,7 +85,7 @@ use_udp = true
 
 [[endpoints]]
 listen = "0.0.0.0:${port}"
-remote = "${dest}:${port}"
+remote = "${dest}:${dport}"
 EOF
     cat > "/etc/systemd/system/$(realm_svc "$port").service" << EOF
 [Unit]
@@ -188,16 +194,16 @@ defaults
 HEADER
     for pf in "$PORTS_DIR"/*; do
         [[ -f "$pf" ]] || continue
-        local P_METHOD="" P_DEST="" P_DPORT="" P_BLOCKED=0; source "$pf"
-        [[ "$P_METHOD" != "haproxy" || "$P_BLOCKED" == "1" ]] && continue
         local port=$(basename "$pf")
+        local P_METHOD="" P_DEST="" P_DPORT="$port" P_BLOCKED=0; source "$pf"
+        [[ "$P_METHOD" != "haproxy" || "$P_BLOCKED" == "1" ]] && continue
         cat >> "$HAPROXY_CFG" << EOF
 frontend ft_${port}
     bind *:${port}
     default_backend bk_${port}
 
 backend bk_${port}
-    server srv1 ${P_DEST}:${port}
+    server srv1 ${P_DEST}:${P_DPORT}
 
 EOF
     done
@@ -269,19 +275,19 @@ sync_all() {
 
 # ═══════════════ IPTABLES RULES ═══════════════
 apply_rules_iptables() {
-    local port="$1" dest="$2"; local cmd=$(ipt "$dest") p
+    local port="$1" dest="$2"; local dport="${3:-$port}"; local cmd=$(ipt "$dest") p
     for p in tcp udp; do
-        $cmd -t nat -A PREROUTING -p "$p" -m multiport --dports "$port" -j DNAT --to-destination "$dest"
-        $cmd -t nat -A POSTROUTING -p "$p" -m multiport --dports "$port" -j MASQUERADE
-        $cmd -t mangle -A FORWARD -p "$p" -s "$dest" --sport "$port" -m comment --comment "pfm_dl_${port}"
+        $cmd -t nat -A PREROUTING -p "$p" -m multiport --dports "$port" -j DNAT --to-destination "$(nat_dest "$dest" "$dport")"
+        $cmd -t nat -A POSTROUTING -p "$p" -m multiport --dports "$dport" -j MASQUERADE
+        $cmd -t mangle -A FORWARD -p "$p" -s "$dest" --sport "$dport" -m comment --comment "pfm_dl_${port}"
     done
 }
 remove_rules_iptables() {
-    local port="$1" dest="$2"; local cmd=$(ipt "$dest") p
+    local port="$1" dest="$2"; local dport="${3:-$port}"; local cmd=$(ipt "$dest") p
     for p in tcp udp; do
-        while $cmd -t nat -D PREROUTING -p "$p" -m multiport --dports "$port" -j DNAT --to-destination "$dest" 2>/dev/null; do :; done
-        while $cmd -t nat -D POSTROUTING -p "$p" -m multiport --dports "$port" -j MASQUERADE 2>/dev/null; do :; done
-        while $cmd -t mangle -D FORWARD -p "$p" -s "$dest" --sport "$port" -m comment --comment "pfm_dl_${port}" 2>/dev/null; do :; done
+        while $cmd -t nat -D PREROUTING -p "$p" -m multiport --dports "$port" -j DNAT --to-destination "$(nat_dest "$dest" "$dport")" 2>/dev/null; do :; done
+        while $cmd -t nat -D POSTROUTING -p "$p" -m multiport --dports "$dport" -j MASQUERADE 2>/dev/null; do :; done
+        while $cmd -t mangle -D FORWARD -p "$p" -s "$dest" --sport "$dport" -m comment --comment "pfm_dl_${port}" 2>/dev/null; do :; done
     done
 }
 apply_accounting_userspace() {
@@ -297,20 +303,20 @@ remove_accounting_userspace() {
     done
 }
 apply_rules() {
-    local port="$1" dest="$2" method="$3"
+    local port="$1" dest="$2" method="$3"; local dport="${4:-$port}"
     case "$method" in
         haproxy) apply_accounting_userspace "$port" "$dest"; rebuild_haproxy_cfg ;;
-        realm)   apply_accounting_userspace "$port" "$dest"; create_realm_service "$port" "$dest" ;;
-        *)       apply_rules_iptables "$port" "$dest" ;;
+        realm)   apply_accounting_userspace "$port" "$dest"; create_realm_service "$port" "$dest" "$dport" ;;
+        *)       apply_rules_iptables "$port" "$dest" "$dport" ;;
     esac
 }
 remove_rules() {
     local port="$1"; [[ ! -f "$PORTS_DIR/$port" ]] && return
-    local P_DEST="" P_METHOD="iptables"; source "$PORTS_DIR/$port"
+    local P_DEST="" P_DPORT="$port" P_METHOD="iptables"; source "$PORTS_DIR/$port"
     case "$P_METHOD" in
         haproxy) remove_accounting_userspace "$port" "$P_DEST" ;;
         realm)   remove_accounting_userspace "$port" "$P_DEST"; remove_realm_service "$port" ;;
-        *)       remove_rules_iptables "$port" "$P_DEST" ;;
+        *)       remove_rules_iptables "$port" "$P_DEST" "$P_DPORT" ;;
     esac
     local cmd=$(ipt "$P_DEST") p
     for p in tcp udp; do
@@ -548,7 +554,7 @@ cmd_install() {
             cp "$src" /usr/local/bin/pfm
         else
             # Running from curl pipe - download again
-            curl -sL "https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm.sh" -o /usr/local/bin/pfm
+            curl -sL "$PFM_REPO_RAW/pfm.sh" -o /usr/local/bin/pfm
         fi
         chmod +x /usr/local/bin/pfm
     fi
@@ -619,12 +625,13 @@ cmd_restore() {
     local need_hp=0
     for f in "$PORTS_DIR"/*; do
         [[ -f "$f" ]] || continue
-        local port=$(basename "$f") P_DEST="" P_METHOD="iptables" P_BLOCKED=0; source "$f"
+        local port=$(basename "$f")
+        local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_BLOCKED=0; source "$f"
         case "$P_METHOD" in
             haproxy) apply_accounting_userspace "$port" "$P_DEST"; need_hp=1 ;;
-            realm)   apply_accounting_userspace "$port" "$P_DEST"; create_realm_service "$port" "$P_DEST"
+            realm)   apply_accounting_userspace "$port" "$P_DEST"; create_realm_service "$port" "$P_DEST" "$P_DPORT"
                      [[ "$P_BLOCKED" == "1" ]] && stop_realm_service "$port" ;;
-            *)       apply_rules_iptables "$port" "$P_DEST"
+            *)       apply_rules_iptables "$port" "$P_DEST" "$P_DPORT"
                      [[ "$P_BLOCKED" == "1" ]] && block_port "$port" ;;
         esac
     done
@@ -687,6 +694,9 @@ menu_add() {
     [[ -f "$PORTS_DIR/$port" ]] && { echo -e "  ${R}Port $port exists${NC}"; sleep 1; return; }
     echo -ne "  ${C}Destination IP:${NC} "; read -r dest
     [[ -z "$dest" ]] && return
+    echo -ne "  ${C}Destination Port [${port}]:${NC} "; read -r dport
+    dport="${dport:-$port}"
+    [[ ! "$dport" =~ ^[0-9]+$ || "$dport" -lt 1 || "$dport" -gt 65535 ]] && { echo -e "  ${R}Invalid destination port${NC}"; sleep 1; return; }
     echo -ne "  ${C}Owner:${NC} "; read -r owner
     [[ -z "$owner" ]] && return
     if [[ ! -f "$USERS_DIR/$owner" ]]; then
@@ -697,7 +707,7 @@ menu_add() {
     cat > "$PORTS_DIR/$port" << EOF
 P_USER="$owner"
 P_DEST="$dest"
-P_DPORT="$port"
+P_DPORT="$dport"
 P_LIMIT=$(gb_to_bytes "$lgb")
 P_LIMIT_GB=$lgb
 P_METHOD="$method"
@@ -706,10 +716,10 @@ P_CREATED=$(date +%s)
 P_BLOCKED=0
 EOF
     echo "0" > "$USAGE_DIR/$port"
-    apply_rules "$port" "$dest" "$method"
+    apply_rules "$port" "$dest" "$method" "$dport"
     local mtag=""; case "$method" in haproxy) mtag="${Y}haproxy${NC}";; realm) mtag="${MAG}realm${NC}";; *) mtag="${G}iptables${NC}";; esac
-    echo -e "\n  ${G}OK!${NC} :${port} -> ${dest}:${port} [${mtag}]"
-    log "Added $port -> $dest method=$method user=$owner"
+    echo -e "\n  ${G}OK!${NC} :${port} -> ${dest}:${dport} [${mtag}]"
+    log "Added $port -> $dest:$dport method=$method user=$owner"
     echo -ne "\n  ${GR}Enter...${NC}"; read -r
 }
 
@@ -724,7 +734,7 @@ menu_manage() {
         for pf in "$PORTS_DIR"/*; do
             [[ -f "$pf" ]] || continue
             local lp=$(basename "$pf")
-            local P_USER="" P_DEST="" P_DPORT="" P_LIMIT=0 P_BLOCKED=0 P_METHOD="iptables"
+            local P_USER="" P_DEST="" P_DPORT="$lp" P_LIMIT=0 P_BLOCKED=0 P_METHOD="iptables"
             source "$pf"
             idx=$((idx + 1))
             ports+=("$lp")
@@ -734,7 +744,7 @@ menu_manage() {
             [[ "$P_BLOCKED" == "1" ]] && st="🔴"
             case "$P_METHOD" in haproxy) mclr="$Y";; realm) mclr="$MAG";; esac
             printf "  ${W}%2d)${NC} Port ${C}%-6s${NC} → ${W}%-18s${NC} [${mclr}%s${NC}] %s  ${GR}%s${NC}  %s\n" \
-                "$idx" "$lp" "${P_DEST}:${lp}" "$P_METHOD" "$st" "$uh" "$P_USER"
+                "$idx" "$lp" "${P_DEST}:${P_DPORT}" "$P_METHOD" "$st" "$uh" "$P_USER"
         done
 
         if [[ $idx -eq 0 ]]; then
@@ -757,7 +767,7 @@ menu_tunnel_detail() {
     while true; do
         [[ ! -f "$PORTS_DIR/$port" ]] && return
         header
-        local P_USER="" P_DEST="" P_DPORT="" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"
+        local P_USER="" P_DEST="" P_DPORT="$port" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"
         source "$PORTS_DIR/$port"
         local u=$(get_port_usage "$port")
         local uh=$(human_bytes $u)
@@ -766,7 +776,8 @@ menu_tunnel_detail() {
         local mclr="$G"; case "$P_METHOD" in haproxy) mclr="$Y";; realm) mclr="$MAG";; esac
 
         echo -e "  ${B}${W}Tunnel — Port ${port}${NC}\n"
-        echo -e "  ${GR}Destination:${NC}  ${W}${P_DEST}:${port}${NC}"
+        echo -e "  ${GR}Listen Port:${NC} ${W}${port}${NC}"
+        echo -e "  ${GR}Destination:${NC}  ${W}${P_DEST}:${P_DPORT}${NC}"
         echo -e "  ${GR}Engine:${NC}       ${mclr}${P_METHOD}${NC}"
         echo -e "  ${GR}Owner:${NC}        ${W}${P_USER}${NC}"
         echo -e "  ${GR}Used:${NC}         ${C}${uh}${NC} / ${lh}"
@@ -775,12 +786,13 @@ menu_tunnel_detail() {
 
         local btxt="Block"; [[ "$P_BLOCKED" == "1" ]] && btxt="Unblock"
         echo -e "  ${W}1)${NC} Edit Destination IP"
-        echo -e "  ${W}2)${NC} Edit Port"
-        echo -e "  ${W}3)${NC} Edit Limit"
-        echo -e "  ${W}4)${NC} Edit Owner"
-        echo -e "  ${W}5)${NC} Reset Usage"
-        echo -e "  ${W}6)${NC} ${btxt}"
-        echo -e "  ${R}7)${NC} Delete Tunnel"
+        echo -e "  ${W}2)${NC} Edit Destination Port"
+        echo -e "  ${W}3)${NC} Edit Listen Port"
+        echo -e "  ${W}4)${NC} Edit Limit"
+        echo -e "  ${W}5)${NC} Edit Owner"
+        echo -e "  ${W}6)${NC} Reset Usage"
+        echo -e "  ${W}7)${NC} ${btxt}"
+        echo -e "  ${R}8)${NC} Delete Tunnel"
         echo -e "  ${W}0)${NC} Back"
         echo -ne "\n  ${C}Select:${NC} "; read -r opt
 
@@ -792,13 +804,29 @@ menu_tunnel_detail() {
                 remove_rules "$port"
                 sed -i "s|P_DEST=\"$P_DEST\"|P_DEST=\"$newdest\"|" "$PORTS_DIR/$port"
                 source "$PORTS_DIR/$port"
-                apply_rules "$port" "$newdest" "$P_METHOD"
+                apply_rules "$port" "$newdest" "$P_METHOD" "$P_DPORT"
                 [[ "$P_BLOCKED" == "1" ]] && block_port "$port"
                 rebuild_haproxy_cfg 2>/dev/null
                 echo -e "  ${G}IP changed: ${P_DEST}${NC}"
                 log "Edit $port dest=$newdest"; sleep 1 ;;
 
-            2)  # Edit Port
+            2)  # Edit Destination Port
+                echo -ne "  ${C}New Destination Port [${P_DPORT}]:${NC} "; read -r newdport
+                [[ -z "$newdport" ]] && continue
+                if [[ ! "$newdport" =~ ^[0-9]+$ || "$newdport" -lt 1 || "$newdport" -gt 65535 ]]; then
+                    echo -e "  ${R}Invalid destination port${NC}"; sleep 1; continue
+                fi
+                sync_port_usage "$port"
+                remove_rules "$port"
+                sed -i "s/P_DPORT=\"$P_DPORT\"/P_DPORT=\"$newdport\"/" "$PORTS_DIR/$port"
+                source "$PORTS_DIR/$port"
+                apply_rules "$port" "$P_DEST" "$P_METHOD" "$P_DPORT"
+                [[ "$P_BLOCKED" == "1" ]] && block_port "$port"
+                rebuild_haproxy_cfg 2>/dev/null
+                echo -e "  ${G}Destination port changed: ${P_DPORT}${NC}"
+                log "Edit $port dport=$newdport"; sleep 1 ;;
+
+            3)  # Edit Listen Port (rename) — destination port/IP are untouched
                 echo -ne "  ${C}New Port [${port}]:${NC} "; read -r newport
                 [[ -z "$newport" ]] && continue
                 [[ -f "$PORTS_DIR/$newport" ]] && { echo -e "  ${R}Port $newport already exists${NC}"; sleep 1; continue; }
@@ -809,17 +837,15 @@ menu_tunnel_detail() {
                 mv "$PORTS_DIR/$port" "$PORTS_DIR/$newport"
                 echo "$old_usage" > "$USAGE_DIR/$newport"
                 rm -f "$USAGE_DIR/$port"
-                # Update port in config
-                sed -i "s/P_DPORT=\"$port\"/P_DPORT=\"$newport\"/" "$PORTS_DIR/$newport"
                 source "$PORTS_DIR/$newport"
-                apply_rules "$newport" "$P_DEST" "$P_METHOD"
+                apply_rules "$newport" "$P_DEST" "$P_METHOD" "$P_DPORT"
                 [[ "$P_BLOCKED" == "1" ]] && block_port "$newport"
                 rebuild_haproxy_cfg 2>/dev/null
-                echo -e "  ${G}Port changed: ${port} → ${newport}${NC}"
+                echo -e "  ${G}Port changed: ${port} → ${newport}${NC}  ${GR}(destination unchanged: ${P_DEST}:${P_DPORT})${NC}"
                 log "Edit port $port -> $newport"
                 port="$newport"; sleep 1 ;;
 
-            3)  # Edit Limit
+            4)  # Edit Limit
                 echo -ne "  ${C}New Limit GB (0=unlimited) [${P_LIMIT_GB}]:${NC} "; read -r newlimit
                 [[ -z "$newlimit" ]] && continue
                 local nb=$(gb_to_bytes "$newlimit")
@@ -828,7 +854,7 @@ menu_tunnel_detail() {
                 echo -e "  ${G}Limit set to ${newlimit} GB${NC}"
                 log "Edit $port limit=$newlimit GB"; sleep 1 ;;
 
-            4)  # Edit Owner
+            5)  # Edit Owner
                 echo -ne "  ${C}New Owner [${P_USER}]:${NC} "; read -r newowner
                 [[ -z "$newowner" ]] && continue
                 if [[ ! -f "$USERS_DIR/$newowner" ]]; then
@@ -840,7 +866,7 @@ menu_tunnel_detail() {
                 echo -e "  ${G}Owner changed: ${newowner}${NC}"
                 log "Edit $port owner=$newowner"; sleep 1 ;;
 
-            5)  # Reset Usage
+            6)  # Reset Usage
                 echo "0" > "$USAGE_DIR/$port"
                 local cmd=$(ipt "$P_DEST") chain=$(get_mangle_chain "$port")
                 while IFS= read -r line; do
@@ -852,7 +878,7 @@ menu_tunnel_detail() {
                 [[ "$P_BLOCKED" == "1" ]] && unblock_port "$port"
                 echo -e "  ${G}Usage reset${NC}"; sleep 1 ;;
 
-            6)  # Block/Unblock
+            7)  # Block/Unblock
                 if [[ "$P_BLOCKED" == "1" ]]; then
                     unblock_port "$port"
                     echo -e "  ${G}Unblocked${NC}"
@@ -861,7 +887,7 @@ menu_tunnel_detail() {
                     echo -e "  ${Y}Blocked${NC}"
                 fi; sleep 1 ;;
 
-            7)  # Delete
+            8)  # Delete
                 echo -ne "  ${R}Delete tunnel ${port}? (y/N):${NC} "; read -r yn
                 [[ "$yn" != "y" && "$yn" != "Y" ]] && continue
                 sync_port_usage "$port"
@@ -896,7 +922,7 @@ menu_view() {
         local tu=0 tl=0
         for pf in "$PORTS_DIR"/*; do
             [[ -f "$pf" ]] || continue; local lp=$(basename "$pf")
-            local P_USER="" P_DEST="" P_DPORT="" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"; source "$pf"
+            local P_USER="" P_DEST="" P_DPORT="$lp" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"; source "$pf"
             [[ "$P_USER" != "$name" ]] && continue
             local u=$(get_port_usage "$lp")
             local uh=$(human_bytes $u) lh="Unlimited" rh="-"
@@ -934,7 +960,7 @@ cmd_monitor() {
         echo -e "  ${GR}$(printf '%.0s─' $(seq 1 78))${NC}"
         for f in "$PORTS_DIR"/*; do
             [[ -f "$f" ]] || continue; local lp=$(basename "$f")
-            local P_USER="" P_DEST="" P_DPORT="" P_LIMIT=0 P_BLOCKED=0 P_METHOD="iptables"; source "$f"
+            local P_USER="" P_DEST="" P_DPORT="$lp" P_LIMIT=0 P_BLOCKED=0 P_METHOD="iptables"; source "$f"
             local u=$(get_port_usage "$lp")
             local uh=$(human_bytes $u) lh="Unlim" st="ON" sc="$G" uc=""
             local mclr="$G"; case "$P_METHOD" in haproxy) mclr="$Y";; realm) mclr="$MAG";; esac
@@ -1068,9 +1094,9 @@ cmd_json() {
         [[ $fu -eq 0 ]] && echo ","; fu=0
         echo "{\"name\":\"$name\",\"tg_id\":\"$TG_ID\",\"enabled\":$ENABLED,\"ports\":["
         local fp=1; for pf in "$PORTS_DIR"/*; do [[ -f "$pf" ]] || continue
-            local P_USER="" P_DEST="" P_DPORT="" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"; source "$pf"
+            local lp=$(basename "$pf")
+            local P_USER="" P_DEST="" P_DPORT="$lp" P_LIMIT=0 P_LIMIT_GB=0 P_BLOCKED=0 P_METHOD="iptables"; source "$pf"
             if [[ "$P_USER" == "$name" ]]; then
-                local lp=$(basename "$pf")
                 local u=$(cat "$USAGE_DIR/$lp" 2>/dev/null || echo 0)
                 [[ $fp -eq 0 ]] && echo ","; fp=0
                 echo "{\"port\":$lp,\"dest\":\"${P_DEST}:${P_DPORT}\",\"method\":\"$P_METHOD\",\"dl_bytes\":$u,\"dl_human\":\"$(human_bytes $u)\",\"limit_bytes\":$P_LIMIT,\"limit_gb\":$P_LIMIT_GB,\"blocked\":$P_BLOCKED}"
