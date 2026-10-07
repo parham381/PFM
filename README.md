@@ -11,7 +11,7 @@
   <p>Port Forwarding Tool with Per-Port Bandwidth Monitoring</p>
 
   <a href="https://t.me/AbrAfagh"><img src="https://img.shields.io/badge/Telegram-Channel-blue?logo=telegram" alt="Telegram"></a>
-  <img src="https://img.shields.io/badge/Version-1.7-green" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.8-green" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
   <img src="https://img.shields.io/badge/OS-Ubuntu%2FDebian-orange" alt="OS">
 </p>
@@ -45,7 +45,7 @@ PFM یک ابزار مدیریت پورت فوروارد با قابلیت ما�
 <div dir="ltr" align="left">
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm.sh) install
+bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm.sh) install
 ```
 
 </div>
@@ -55,7 +55,7 @@ bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm.sh) i
 <div dir="ltr" align="left">
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm-bot-setup.sh)
+bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm-bot-setup.sh)
 ```
 
 </div>
@@ -108,13 +108,13 @@ pfm doctor 443      # بررسی فقط یک پورت
 ## 🚀 Quick Install
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm.sh) install
+bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm.sh) install
 ```
 
 ## 📦 Manual Install
 
 ```bash
-curl -o /usr/local/bin/pfm https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm.sh
+curl -o /usr/local/bin/pfm https://raw.githubusercontent.com/parham381/PFM/main/pfm.sh
 chmod +x /usr/local/bin/pfm
 pfm install
 ```
@@ -124,7 +124,7 @@ pfm install
 The bot allows you to manage all your PFM servers remotely from Telegram.
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm-bot-setup.sh)
+bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm-bot-setup.sh)
 ```
 
 **Bot Features:**
@@ -144,7 +144,7 @@ bash <(curl -s https://raw.githubusercontent.com/SadraHimself/PFM/main/pfm-bot-s
 
 ```
   ──────────────────────────────────────────
-         PFM - Port Forward Manager v1.7
+         PFM - Port Forward Manager v1.8
               https://t.me/AbrAfagh
   ──────────────────────────────────────────
 

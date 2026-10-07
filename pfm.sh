@@ -8,7 +8,7 @@
 #   ██║     ██║     ██║ ╚═╝ ██║
 #   ╚═╝     ╚═╝     ╚═╝     ╚═╝
 #
-#   Port Forward Manager v1.7
+#   Port Forward Manager v1.8
 #
 #   Telegram: https://t.me/AbrAfagh
 #
@@ -693,7 +693,7 @@ header() {
     echo -e "        ██║     ██║     ██║ ╚═╝ ██║"
     echo -e "        ╚═╝     ╚═╝     ╚═╝     ╚═╝${NC}"
     echo -e "  ${C}──────────────────────────────────────────${NC}"
-    echo -e "  ${B}${C}       PFM - Port Forward Manager v1.7${NC}"
+    echo -e "  ${B}${C}       PFM - Port Forward Manager v1.8${NC}"
     echo -e "  ${GR}            https://t.me/AbrAfagh${NC}"
     echo -e "  ${C}──────────────────────────────────────────${NC}\n"
 }
@@ -867,8 +867,8 @@ EOF
     systemctl enable pfm-restore.service > /dev/null 2>&1
     # cleanup_old dropped the accounting/block rules: bring every existing tunnel back in place
     cmd_restore
-    echo -e "  ${G}PFM v1.7 installed${NC}"
-    log "PFM v1.7 installed"; sleep 1; cmd_menu
+    echo -e "  ${G}PFM v1.8 installed${NC}"
+    log "PFM v1.8 installed"; sleep 1; cmd_menu
 }
 
 cmd_restore() {
