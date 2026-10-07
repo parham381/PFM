@@ -7,7 +7,7 @@ CONFIG_DIR="/etc/pfm-bot"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 BOT_SCRIPT="/usr/local/bin/pfm-bot"
 SERVICE_FILE="/etc/systemd/system/pfm-bot.service"
-REPO_RAW="https://raw.githubusercontent.com/SadraHimself/PFM/main"
+REPO_RAW="https://raw.githubusercontent.com/parham381/PFM/main"
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
 W='\033[1;37m'; GR='\033[0;90m'; NC='\033[0m'; B='\033[1m'
