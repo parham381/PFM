@@ -1,0 +1,41 @@
+name: Release
+
+# Publishes a GitHub Release. Run it from the Actions tab ("Run workflow") or by pushing a tag v*.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v1.8 (created if it does not exist)"
+        required: true
+      target:
+        description: "Commit SHA the tag should point at (default: the commit the workflow runs on)"
+        required: false
+      notes:
+        description: "Release notes (markdown)"
+        required: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ github.event.inputs.target || github.sha }}
+          NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists"; exit 0
+          fi
+          if [ -n "$NOTES" ]; then
+            gh release create "$TAG" --target "$TARGET" --title "PFM $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --target "$TARGET" --title "PFM $TAG" --generate-notes
+          fi
