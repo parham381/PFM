@@ -219,6 +219,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
 - قبل از هر تغییر، برنامهٔ فعلی و **فهرست تانل‌ها** در `/etc/pfm/backups` ذخیره می‌شود (۶ مورد آخر)؛ پس حتی اگر گیتهاب در دسترس نباشد، نسخه‌های ذخیره‌شده در همان منو دیده می‌شوند و قابل نصب‌اند
 - نصب با خود نصب‌کنندهٔ همان نسخه انجام می‌شود (قوانین، سرویس‌ها و کرون همان نسخه) و بلافاصله **همهٔ تانل‌ها بررسی می‌شوند**؛ اگر چیزی خراب بود پیشنهاد برگشت با یک کلید داده می‌شود
 - برگشت به نسخه‌ای قدیمی‌تر از ۲.۰ که دستیار بهینه‌سازی را نمی‌شناسد: می‌پرسد تنظیمات دستیار (کرنل، کارت شبکه، DNS، پروفایل‌ها) به حالت اول برگردد یا نه
+- نسخه‌های قبل از ۲.۰ دستور `switch` و `rollback` ندارند؛ بعد از برگشت به آن‌ها همین برنامه دستور دقیق بازگشت را چاپ می‌کند: `bash /etc/pfm/backups/pfm-v2.0-….sh install` (بدون اینترنت) یا همان دستور نصب سریع
 - فقط فایل کامل و سالم نصب می‌شود (سینتکس و هدر نسخه بررسی می‌شود؛ صفحهٔ خطا یا فایل ناقص رد می‌شود) و جایگزینی اتمیک است
 - خط فرمان: `pfm versions` · `pfm switch v1.9` · `pfm update` · `pfm rollback`
 
@@ -480,7 +481,8 @@ It installs iperf3, accepts only that IP (temporary firewall rules), and stops b
 - Lists the releases published on GitHub (installed one marked). Type a number to switch to it, `i2` shows the notes of a release, `u` installs the newest, `r` rolls back to what you had before the last change
 - Before any change the running program and the **tunnel list** are saved in `/etc/pfm/backups` (last 6). Even without GitHub those saved versions show up in the same menu and can be installed
 - The version is installed by *its own* installer (its rules, services and cron), then **every tunnel is checked**; if something is broken you are offered the way back with one key
-- Going below 2.0, which does not know the Optimization Assistant, asks whether the assistant's changes (kernel, NIC, DNS, profiles) should be put back to the original values
+- Going below 2.0, which does not know the Optimization Assistant, asks whether the assistant's changes (kernel, NIC, DNS, profiles) should be put back to the original values (a non-interactive `-y` run keeps them)
+- Releases before 2.0 have no `switch` / `rollback` command; after switching to one, the exact way back is printed: `bash /etc/pfm/backups/pfm-v2.0-….sh install` (works offline) or the Quick Install command
 - Only a complete, valid script is installed (syntax and version header are checked; an error page or truncated download is refused) and the file is replaced atomically
 - CLI: `pfm versions` · `pfm switch v1.9` · `pfm update` · `pfm rollback`
 

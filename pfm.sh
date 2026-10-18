@@ -50,13 +50,13 @@ W='\033[1;37m'; GR='\033[0;90m'; NC='\033[0m'; B='\033[1m'
 MAG='\033[0;35m'
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null; }
-PFM_SELF="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2> /dev/null || echo "${BASH_SOURCE[0]:-$0}")"
+PFM_SELF="$(readlink -f "${BASH_SOURCE[0]:-}" 2> /dev/null)"      # "" when the text came through a pipe (curl | bash -s)
 PFM_ARGS=("$@")
 check_root() {    # typing `PFM` as a normal user asks sudo instead of giving up
     [[ $EUID -eq 0 ]] && return 0
-    if command -v sudo > /dev/null 2>&1 && [[ -f "$PFM_SELF" && "$PFM_SELF" != /dev/* && "$PFM_SELF" != /proc/* ]]; then
+    if [[ -z "${PFM_REEXEC:-}" ]] && command -v sudo > /dev/null 2>&1 && [[ -n "$PFM_SELF" && -f "$PFM_SELF" && "$PFM_SELF" != /dev/* && "$PFM_SELF" != /proc/* ]]; then
         echo -e "${GR}PFM needs root - asking sudo ...${NC}" >&2
-        exec sudo bash "$PFM_SELF" "${PFM_ARGS[@]}"
+        exec sudo env PFM_REEXEC=1 bash "$PFM_SELF" "${PFM_ARGS[@]}"
     fi
     echo -e "${R}Run as root${NC}  ${GR}(sudo -i first, or put sudo in front of the command: sudo PFM)${NC}"; exit 1
 }
@@ -2375,6 +2375,7 @@ cmd_bench() {    # pfm bench <port> [quick|full] [--peer PORT] [--yes] [--mask]
     while [[ $# -gt 0 ]]; do
         case "$1" in
             quick|full) mode="$1" ;; --peer) pp="${2:-5201}"; shift ;; --yes|-y) PFM_YES=1 ;; --mask) BN_MASK=1 ;;
+            *) echo "unknown option '$1'"; echo "usage: pfm bench <port> [quick|full] [--peer PORT] [--yes] [--mask]"; return 1 ;;
         esac; shift
     done
     ensure_tool ping "latency test" > /dev/null || { echo "ping is required"; return 1; }
@@ -3380,32 +3381,49 @@ validate_pfm_script() {    # 0 = a complete, loadable PFM release; otherwise pri
 }
 
 # ── backups: the program that is about to be replaced + the tunnel list ──
-backup_current() {    # prints the path of the saved program ("" when there was nothing to save)
-    local ver ts last keep="$PFM_KEEP_BACKUPS" f out=""
+file_sum() { [[ -f "$1" ]] || return 0; if command -v sha256sum > /dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else cksum "$1" | awk '{ print $1 "-" $2 }'; fi; }
+bk_key() { local b="${1##*/}" t; b="${b%.*}"; t="${b##*-}"; b="${b%-*}"; echo "${b##*-}$t"; }      # pfm-v2.0-20261018-120000.sh -> 20261018120000
+backup_files() {    # backup_files <name prefix> -> the saved files of that kind, newest first (by the time in the NAME: a copy keeps the age of the program it holds)
+    local f
+    for f in "$BACKUP_DIR"/"$1"*; do [[ -f "$f" ]] && echo "$(bk_key "$f") $f"; done | sort -r | cut -d' ' -f2-
+}
+backup_current() {    # prints the path of the saved program ("" = there was nothing to save); returns 1 when it could not be saved
+    local ver ts last out="" n d=()
     [[ -f "$PFM_BIN" ]] || return 0
-    mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR" 2> /dev/null
+    mkdir -p "$BACKUP_DIR" 2> /dev/null && chmod 700 "$BACKUP_DIR" 2> /dev/null
     ver=$(version_of_file "$PFM_BIN"); ver="${ver//[^0-9A-Za-z.]/x}"; ver="${ver:-unknown}"; ts=$(date +%Y%m%d-%H%M%S)
-    last=$(ls -1t "$BACKUP_DIR"/pfm-v"$ver"-*.sh 2> /dev/null | head -1)      # the same program saved already: keep that one
+    last=$(backup_files "pfm-v$ver-" | head -1)                    # the same program saved already: keep that one
     if [[ -n "$last" ]] && cmp -s "$last" "$PFM_BIN"; then out="$last"
-    else out="$BACKUP_DIR/pfm-v$ver-$ts.sh"; cp -p "$PFM_BIN" "$out"; fi
-    local d=() n
-    for n in ports users usage tune; do [[ -d "$PFM_DIR/$n" ]] && d+=("$n"); done
-    (( ${#d[@]} )) && tar -czf "$BACKUP_DIR/data-v$ver-$ts.tgz" -C "$PFM_DIR" "${d[@]}" 2> /dev/null
-    for f in pfm-v data-v; do      # keep the newest few of each
-        # shellcheck disable=SC2012
-        ls -1t "$BACKUP_DIR"/"$f"* 2> /dev/null | tail -n +$((keep + 1)) | while IFS= read -r n; do rm -f -- "$n"; done
-    done
+    else
+        out="$BACKUP_DIR/pfm-v$ver-$ts.sh"
+        if ! cp "$PFM_BIN" "$out" 2> /dev/null || ! cmp -s "$PFM_BIN" "$out"; then rm -f "$out"; return 1; fi       # a cut-off copy (disk full) is no backup
+    fi
+    for n in ports users usage tune mtu; do [[ -d "$PFM_DIR/$n" ]] && d+=("$n"); done
+    [[ -f "$PFM_CONF" ]] && d+=(pfm.conf)
+    if (( ${#d[@]} )) && ! tar -czf "$BACKUP_DIR/data-v$ver-$ts.tgz" -C "$PFM_DIR" "${d[@]}" 2> /dev/null; then rm -f "$BACKUP_DIR/data-v$ver-$ts.tgz"; fi
     echo "$out"
+}
+prune_backups() {    # keep the newest few saved programs / tunnel lists; the files given as arguments are never touched
+    local kind keep="$PFM_KEEP_BACKUPS" f n protect=" $* "
+    for kind in pfm-v data-v; do
+        n=0
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            n=$((n + 1)); (( n > keep )) || continue
+            [[ "$protect" == *" $f "* ]] || rm -f -- "$f"
+        done < <(backup_files "$kind")
+    done
 }
 install_file_atomic() {    # install_file_atomic <src> <dst>: write next to it, then rename - a running copy never sees half a file
     local src="$1" dst="$2" tmp="$2.new.$$"
     cp "$src" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
 }
 install_self() {    # put this very script at /usr/local/bin/pfm; the program it replaces is saved first
-    local src="${PFM_INSTALL_SRC:-$PFM_SELF}" tmp="" why nv
-    [[ "$src" == "$PFM_BIN" ]] && return 0                      # already running from there
-    if [[ ! -f "$src" || "$src" == /dev/* || "$src" == /proc/* ]]; then
-        # started with `bash <(curl ...)`: the text is gone, fetch the same file again
+    local src="${PFM_INSTALL_SRC:-$PFM_SELF}" tmp="" why nv cur bk
+    if [[ -n "${PFM_INSTALL_SRC:-}" && ! -f "$PFM_INSTALL_SRC" ]]; then echo -e "  ${R}The file to install ($PFM_INSTALL_SRC) is gone.${NC}"; return 1; fi
+    if [[ -n "$src" && "$src" == "$PFM_BIN" ]]; then chmod 755 "$PFM_BIN" 2> /dev/null; return 0; fi          # already running from there
+    if [[ -z "$src" || ! -f "$src" || "$src" == /dev/* || "$src" == /proc/* ]]; then
+        # started with `bash <(curl ...)` or `curl ... | bash -s install`: the text is gone, fetch the same file again
         tmp=$(mktemp "${TMPDIR:-/tmp}/pfm-install.XXXXXX") || return 1
         if ! GH_TIMEOUT=90 gh_fetch -o "$tmp" "$PFM_REPO_RAW/pfm.sh"; then
             rm -f "$tmp"; echo -e "  ${R}Could not download $PFM_REPO_RAW/pfm.sh${NC}  ${GR}(GitHub unreachable? see PFM_REPO_RAW / PFM_CURL_OPTS in $PFM_CONF)${NC}"; return 1
@@ -3417,13 +3435,16 @@ install_self() {    # put this very script at /usr/local/bin/pfm; the program it
     fi
     nv=$(version_of_file "$src")
     if [[ -n "$tmp" && "$nv" != "$PFM_VERSION" && -z "${PFM_HANDOFF:-}" ]]; then
-        # GitHub moved on while this copy was starting: let the version that was downloaded do its own install
-        echo -e "  ${GR}Newer file on GitHub (v$nv): continuing with it${NC}"
+        # the file GitHub serves now is another version than the copy that was just started: let that version do its own install
+        echo -e "  ${GR}GitHub now serves v$nv (this copy is v$PFM_VERSION): continuing with v$nv${NC}"
         PFM_HANDOFF=1 bash "$tmp" install "$@"; local rc=$?; rm -f "$tmp"; exit $rc
     fi
-    if [[ -f "$PFM_BIN" ]] && cmp -s "$src" "$PFM_BIN"; then [[ -n "$tmp" ]] && rm -f "$tmp"; return 0; fi
-    backup_current > /dev/null
+    if [[ -f "$PFM_BIN" ]] && cmp -s "$src" "$PFM_BIN"; then chmod 755 "$PFM_BIN" 2> /dev/null; [[ -n "$tmp" ]] && rm -f "$tmp"; return 0; fi
+    cur=$(installed_version)
+    bk=$(backup_current) || { echo -e "  ${R}Could not save the program that is installed now (disk full?) - not replacing it.${NC}"; [[ -n "$tmp" ]] && rm -f "$tmp"; return 1; }
+    [[ -n "$bk" ]] && record_switch "$cur" "$bk" "$nv" ""
     install_file_atomic "$src" "$PFM_BIN" || { echo -e "  ${R}Could not write $PFM_BIN${NC}"; [[ -n "$tmp" ]] && rm -f "$tmp"; return 1; }
+    [[ -n "$bk" ]] && { record_switch "$cur" "$bk" "$nv" "$(file_sum "$PFM_BIN")"; prune_backups "$bk"; }
     [[ -n "$tmp" ]] && rm -f "$tmp"
     return 0
 }
@@ -3554,12 +3575,13 @@ ver_load() {    # fills VER_TAG/VER_DATE/VER_INFO from GitHub and remembers the 
         [[ -n "$tag" ]] && valid_tag "$tag" || continue
         VER_TAG+=("$tag"); VER_DATE+=("$date"); VER_INFO+=("$info")
     done <<< "$out"
-    mkdir -p "$PFM_DIR" 2> /dev/null
-    printf '%s\n' "${VER_TAG[@]}" > "$PFM_DIR/latest.list" 2> /dev/null
-    for i in "${!VER_TAG[@]}"; do
-        ver_is_pre "${VER_TAG[i]}" "${VER_INFO[i]}" && continue
-        echo "${VER_TAG[i]}" > "$PFM_DIR/latest.ver" 2> /dev/null; break
-    done
+    if [[ -d "$PFM_DIR" ]]; then        # cache for the main menu hint and Tab completion (root only; silent otherwise)
+        { printf '%s\n' "${VER_TAG[@]}" > "$PFM_DIR/latest.list"; } 2> /dev/null
+        for i in "${!VER_TAG[@]}"; do
+            ver_is_pre "${VER_TAG[i]}" "${VER_INFO[i]}" && continue
+            { echo "${VER_TAG[i]}" > "$PFM_DIR/latest.ver"; } 2> /dev/null; break
+        done
+    fi
 }
 ver_latest() {    # newest stable tag found by ver_load
     local i
@@ -3591,12 +3613,14 @@ versions_verify() {    # one block per broken tunnel; prints nothing when all wo
     return "$bad"
 }
 count_tunnels() { local f n=0; for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && n=$((n + 1)); done; echo "$n"; }
-install_release_file() {    # run the installer OF that release (its own rules/services/cron logic) without its menu; 0 = file in place
+install_release_file() {    # run the installer OF that release (its own rules/services/cron logic) without its menu. 0 = installed · 2 = in place, but that installer reported an error · 1 = could not install
     local f="$1" wrap log rc
     wrap=$(mktemp "${TMPDIR:-/tmp}/pfm-switch.XXXXXX") || return 1
     log=$(mktemp "${TMPDIR:-/tmp}/pfm-switch-log.XXXXXX") || { rm -f "$wrap"; return 1; }
     {
-        sed '/^main "\$@"$/d' "$f"
+        # the release without its last line `main "$@"` (only the last one: a heredoc may contain the same text)
+        awk '{ l[NR] = $0 } END { last = 0; for (i = NR; i >= 1; i--) if (l[i] == "main \"$@\"") { last = i; break }
+                                  for (i = 1; i <= NR; i++) if (i != last) print l[i] }' "$f"
         cat << 'WRAP'
 # --- appended by the version switcher: run that release's installer, but do not open its menu or clear the screen ---
 cmd_menu() { :; }
@@ -3610,17 +3634,18 @@ cmd_install
 WRAP
     } > "$wrap"
     PFM_SWITCH_WRAPPER="$wrap" PFM_SWITCH_SOURCE="$f" PFM_INSTALL_SRC="$f" PFM_NO_MENU=1 timeout 300 bash "$wrap" < /dev/null > "$log" 2>&1; rc=$?
-    if (( rc != 0 )) && ! cmp -s "$f" "$PFM_BIN"; then
-        echo -e "  ${R}The installer of that version failed (exit $rc):${NC}"; tail -n 12 "$log" | sed 's/^/    /'
-    fi
+    if (( rc != 0 )); then echo -e "  ${R}The installer of that version reported an error (exit $rc):${NC}"; tail -n 12 "$log" | sed 's/^/    /'; fi
     rm -f "$wrap" "$log"
     # the installer should have placed the file; make sure of it
     cmp -s "$f" "$PFM_BIN" || install_file_atomic "$f" "$PFM_BIN" || return 1
+    chmod 755 "$PFM_BIN" 2> /dev/null
+    (( rc == 0 )) || return 2
     return 0
 }
-record_switch() { printf 'FROM_VERSION=%s\nFROM_FILE=%s\nTO_VERSION=%s\nAT=%s\n' "$1" "$2" "$3" "$(date +%s)" > "$LAST_SWITCH"; }
-switch_to_file() {    # switch_to_file <validated pfm.sh> <label>  -> 0 = the version runs and every tunnel was checked
-    local f="$1" label="$2" cur new bk bad nt keep=1 probs
+record_switch() { printf 'FROM_VERSION=%s\nFROM_FILE=%s\nTO_VERSION=%s\nTO_SUM=%s\nAT=%s\n' "$1" "$2" "$3" "$4" "$(date +%s)" > "$LAST_SWITCH"; }
+switch_to_file() {    # switch_to_file <pfm.sh> <label> -> 0 = installed and every tunnel works · 3 = installed but something is wrong (the caller offers the way back) · 1 = nothing was changed
+    local f="$1" label="$2" cur new bk bad nt keep=1 probs why irc sum
+    if why=$(validate_pfm_script "$f"); then :; else echo -e "  ${R}Refusing to install: ${why}${NC}"; return 1; fi
     cur=$(installed_version); new=$(version_of_file "$f"); nt=$(count_tunnels)
     echo -e "\n  ${B}${W}Switch${NC}  ${C}v${cur}${NC}  →  ${C}v${new}${NC}  ${GR}(${label})${NC}\n"
     if [[ "$cur" == "$new" ]] && cmp -s "$f" "$PFM_BIN"; then echo -e "  ${G}This exact version is already installed.${NC}"; return 0; fi
@@ -3632,23 +3657,39 @@ switch_to_file() {    # switch_to_file <validated pfm.sh> <label>  -> 0 = the ve
     if [[ "$(ver_cmp "$new" 2.0)" == -1 ]] && assist_has_changes; then
         echo -e "\n  ${Y}v${new} does not know the Optimization Assistant, so it cannot look after what the assistant changed${NC}"
         echo -e "  ${Y}(kernel settings, network card, DNS, tunnel profiles, pinned MTUs).${NC}"
-        echo -e "  ${GR}If you are switching because something went wrong, putting everything back to the original values is the safe choice.${NC}"
-        confirm "Put those settings back to their original values first?" y && keep=0
+        if [[ "${PFM_YES:-0}" == 1 ]]; then
+            echo -e "  ${GR}Non-interactive run: those settings stay as they are (undo them later with: pfm optimize revert, in v2.0).${NC}"
+        else
+            echo -e "  ${GR}If you are switching because something went wrong, putting everything back to the original values is the safe choice.${NC}"
+            confirm "Put those settings back to their original values after the switch?" n && keep=0
+        fi
     fi
     echo ""; confirm "Switch to v${new} now?" y || { echo -e "  ${GR}Nothing changed.${NC}"; return 1; }
-    bk=$(backup_current)
+    bk=$(backup_current) || { echo -e "  ${R}Could not save the program that is installed now (disk full?) - nothing was changed.${NC}"; return 1; }
     [[ -n "$bk" ]] && echo -e "  ${G}✔${NC} saved: ${GR}${bk}${NC}"
-    (( keep == 0 )) && { tune_revert_all quiet > /dev/null 2>&1; echo -e "  ${G}✔${NC} assistant settings reverted"; }
-    echo -e "  ${GR}Installing v${new} ...${NC}"
-    install_release_file "$f" || { echo -e "  ${R}Could not install v${new}.${NC}"; return 1; }
-    echo -e "  ${G}✔${NC} v${new} installed"
-    [[ -n "$bk" ]] && record_switch "$cur" "$bk" "$new"
+    [[ -n "$bk" ]] && record_switch "$cur" "$bk" "$new" ""      # written first: the way back exists even if this process is killed half way
+    echo -e "  ${GR}Installing v${new} (please do not interrupt) ...${NC}"
+    trap '' HUP INT                                              # a dropped SSH session or a stray Ctrl+C must not leave the switch half done
+    install_release_file "$f"; irc=$?
+    trap - HUP INT
+    if (( irc == 1 )); then echo -e "  ${R}Could not install v${new}.${NC}"; return 1; fi
+    sum=$(file_sum "$PFM_BIN"); [[ -n "$bk" ]] && record_switch "$cur" "$bk" "$new" "$sum"
+    if (( irc == 0 )); then echo -e "  ${G}✔${NC} v${new} installed"
+    else echo -e "  ${Y}!${NC} v${new} is in place, but its installer reported an error (shown above): cron / services may not be up to date"; fi
     log "SWITCH v$cur -> v$new ($label)"
-    sleep 2                                     # realm / haproxy need a moment to bind
+    (( keep == 0 )) && { tune_revert_all quiet > /dev/null 2>&1; echo -e "  ${G}✔${NC} assistant settings reverted"; }
+    sleep 2                                                      # realm / haproxy need a moment to bind
     probs=$(versions_verify); bad=$?
+    prune_backups "$bk" "$f"
     if (( bad == 0 )); then
         echo -e "  ${G}✔${NC} ${nt} tunnel(s) checked - all working"
-        return 0
+        if [[ "$(ver_cmp "$new" 2.0)" == -1 && -n "$bk" ]]; then
+            echo -e "\n  ${GR}v${new} has no switch / rollback command. To come back to v${cur}:${NC}"
+            echo -e "    ${W}bash ${bk} install${NC}   ${GR}(from this server, no internet needed)${NC}"
+            echo -e "    ${W}bash <(curl -sL ${PFM_REPO_RAW}/pfm.sh) install${NC}   ${GR}(newest release)${NC}"
+        fi
+        (( irc == 0 )) && return 0
+        return 3
     fi
     echo -e "  ${R}✗ ${bad} of ${nt} tunnel(s) are not working with v${new}:${NC}"
     echo -e "${R}${probs}${NC}"
@@ -3672,15 +3713,15 @@ switch_version() {    # switch_version <tag|main>
     return "$rc"
 }
 rollback_version() {    # undo the last switch/update: install the program that was running before it
-    local FROM_VERSION="" FROM_FILE="" TO_VERSION="" AT="" f v cur
-    cur=$(installed_version)
+    local FROM_VERSION="" FROM_FILE="" TO_VERSION="" TO_SUM="" AT="" f v
     [[ -r "$LAST_SWITCH" ]] && source "$LAST_SWITCH"
-    if [[ -z "$FROM_FILE" || ! -f "$FROM_FILE" || "$(version_of_file "$FROM_FILE")" == "$cur" ]]; then
-        FROM_FILE=""
-        while IFS='|' read -r f v _; do [[ "$v" != "$cur" ]] && { FROM_FILE="$f"; break; }; done < <(ver_list_local)
+    # trust the record only while it still describes what is installed; the saved copy must differ from the installed program
+    if [[ -n "$FROM_FILE" && -f "$FROM_FILE" && ( -z "$TO_SUM" || "$TO_SUM" == "$(file_sum "$PFM_BIN")" ) ]] && ! cmp -s "$FROM_FILE" "$PFM_BIN"; then :
+    else
+        FROM_FILE=""        # otherwise: the newest saved program whose CONTENT differs from the installed one
+        while IFS='|' read -r f v _; do cmp -s "$f" "$PFM_BIN" || { FROM_FILE="$f"; break; }; done < <(ver_list_local)
     fi
     [[ -n "$FROM_FILE" && -f "$FROM_FILE" ]] || { echo -e "  ${Y}There is no earlier version saved on this server.${NC}"; return 1; }
-    local why; if why=$(validate_pfm_script "$FROM_FILE"); then :; else echo -e "  ${R}The saved copy is damaged: ${why}${NC}"; return 1; fi
     switch_to_file "$FROM_FILE" "saved on this server"
 }
 
@@ -3754,7 +3795,13 @@ menu_versions() {
 }
 cmd_versions() {    # pfm versions | switch <tag> | update | rollback | version      (-y answers yes)
     local sub="$1" a target="" rc; shift
-    for a in "$@"; do case "$a" in -y|--yes) PFM_YES=1 ;; -*) ;; *) [[ -z "$target" ]] && target="$a" ;; esac; done
+    for a in "$@"; do
+        case "$a" in
+            -y|--yes) PFM_YES=1 ;;
+            -*) echo -e "  ${R}Unknown option: $a${NC}  ${GR}(PFM help)${NC}"; return 1 ;;
+            *) [[ -z "$target" ]] && target="$a" ;;
+        esac
+    done
     case "$sub" in
         version)
             echo "PFM v$PFM_VERSION"
@@ -4369,7 +4416,8 @@ usage() {
 }
 
 main() {
-    local cmd="${1:-menu}"; cmd="${cmd,,}"; [[ $# -gt 0 ]] && shift
+    local cmd="${1:-menu}" a; cmd="${cmd,,}"; [[ $# -gt 0 ]] && shift
+    for a in "$@"; do [[ "$a" == -h || "$a" == --help ]] && { usage; return 0; }; done       # never start the real action for a help request
     case "$cmd" in
         install) cmd_install "$@" ;;
         uninstall) cmd_uninstall ;;
