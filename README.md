@@ -11,7 +11,7 @@
   <p>Port Forwarding Tool with Per-Port Bandwidth Monitoring</p>
 
   <a href="https://t.me/AbrAfagh"><img src="https://img.shields.io/badge/Telegram-Channel-blue?logo=telegram" alt="Telegram"></a>
-  <img src="https://img.shields.io/badge/Version-1.8-green" alt="Version">
+  <img src="https://img.shields.io/badge/Version-1.9-green" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
   <img src="https://img.shields.io/badge/OS-Ubuntu%2FDebian-orange" alt="OS">
 </p>
@@ -38,6 +38,8 @@ PFM یک ابزار مدیریت پورت فوروارد با قابلیت ما�
 - **تایید واقعی تانل** — بعد از افزودن تانل بررسی می‌شود پورت واقعاً باز است؛ در غیر این صورت علت نمایش داده می‌شود و تانل ناقص ساخته نمی‌شود
 - **ترمیم خودکار** — اگر ufw/Docker/اسکریپت دیگری قوانین iptables را پاک کند، `pfm sync` (کرون هر ۵ دقیقه) آن‌ها را برمی‌گرداند
 - **تشخیص مشکل** — دستور `pfm doctor` دلیل کار نکردن هر تانل را نشان می‌دهد
+- **تشخیص قانون بیگانه روی پورت** — اگر ابزار دیگری (تانل‌منیجر دیگر، Docker، firewalld، قانون تست فراموش‌شده) همان پورت را DNAT/REDIRECT کند و ترافیک را قبل از تانل بدزدد، `pfm doctor` خود قانون، تعداد بسته‌ها و دستور حذفش را نشان می‌دهد؛ هنگام افزودن تانل هم قبلش هشدار می‌دهد
+- **شمارنده «رسید / تحویل شد»** — برای هر تانل شمرده می‌شود چند بسته از بیرون به سرور رسیده و چندتا واقعاً به تانل رسیده است؛ اگر بسته‌ها می‌رسند ولی به تانل نمی‌رسند (قانون بیگانه، rp_filter، فایروال) هشدار داده می‌شود و `pfm sync` آن را در لاگ می‌نویسد
 - **پشتیبانی IPv4 و IPv6**
 
 ### 🚀 نصب سریع
@@ -79,6 +81,24 @@ pfm doctor 443      # بررسی فقط یک پورت
 - قوانین iptables توسط برنامه دیگری پاک شده یا `ip_forward` صفر شده
 - مقصد از روی همین سرور قابل دسترسی نیست (IP/پورت اشتباه یا مسدود بودن سرور)
 
+#### تست محلی سالم است ولی از بیرون کار نمی‌کند؟
+
+`nc 127.0.0.1 <port>` و بقیهٔ تست‌های محلی از `PREROUTING` عبور نمی‌کنند، پس حتی وقتی ابزار دیگری ترافیک بیرونی را می‌دزدد سالم به نظر می‌رسند. `pfm doctor <port>` حالا این حالت را مستقیم نشان می‌دهد:
+
+- قانون NAT بیگانه روی همان پورت (iptables، ip6tables و nftables؛ شامل قوانین زنجیره‌های Docker و بازه‌ها و چند‌پورتی) همراه با تعداد بسته و دستور حذف. PFM هیچ‌وقت قانون ابزار دیگر را خودکار پاک نمی‌کند — قبل از حذف حتماً بکاپ بگیرید: `iptables-save > /root/iptables.bak`
+- شمارنده بسته‌های رسیده در برابر بسته‌های تحویل‌شده به تانل — بعد از وصل شدن یک کلاینت واقعی دوباره `pfm doctor <port>` را بزنید
+
+برای بررسی دستی بدون PFM:
+
+<div dir="ltr" align="left">
+
+```bash
+iptables-save -t nat | grep -- '--dport <port>'      # چه کسی این پورت را DNAT می‌کند؟
+tcpdump -ni any "tcp port <port>" -c 10             # بسته می‌رسد؟ از کدام اینترفیس برمی‌گردد؟
+```
+
+</div>
+
 ### 📬 ارتباط با ما
 
 - کانال تلگرام: [@AbrAfagh](https://t.me/AbrAfagh)
@@ -101,6 +121,8 @@ pfm doctor 443      # بررسی فقط یک پورت
 - **Verified Tunnels** — A new tunnel is checked to really be listening / in place; if not, the real reason is shown and nothing half-configured is left behind
 - **Self-Healing** — If ufw/Docker/another script flushes the iptables rules, `pfm sync` (cron, every 5 min) puts them back
 - **Diagnostics** — `pfm doctor` explains why a tunnel does not forward
+- **Foreign NAT detection** — if another tool (a different tunnel manager, Docker, firewalld, a forgotten test rule) DNATs/REDIRECTs the same port and takes the traffic before the tunnel, `pfm doctor` shows the rule, its packet count and the command that removes it; adding a tunnel on such a port warns first
+- **Arrived / delivered counters** — per tunnel PFM counts the packets that reach the server and the ones that actually reach the tunnel; when packets arrive but do not get there (foreign rule, rp_filter, firewall) `pfm doctor` says so and `pfm sync` writes it to the log
 - **MTU Management** — Persistent MTU settings per interface
 - **IPv4 & IPv6** — Full dual-stack support
 - **Menu-Driven** — Easy interactive CLI interface
@@ -144,7 +166,7 @@ bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm-bot-setu
 
 ```
   ──────────────────────────────────────────
-         PFM - Port Forward Manager v1.8
+         PFM - Port Forward Manager v1.9
               https://t.me/AbrAfagh
   ──────────────────────────────────────────
 
@@ -196,6 +218,7 @@ bash <(curl -s https://raw.githubusercontent.com/parham381/PFM/main/pfm-bot-setu
 ├── ports/                  # Port configs
 ├── usage/                  # Traffic data (bytes)
 ├── mtu/                    # MTU settings
+├── health/                 # Counter snapshots of the last `pfm sync`
 └── realm/                  # Realm TOML configs
 ```
 
@@ -221,6 +244,21 @@ Tunnel added but no traffic? Run `pfm doctor` (or `pfm doctor <port>`). Typical 
 - `FORWARD`/`INPUT` default policy is `DROP` (ufw, Docker) — PFM now installs its own per-tunnel `ACCEPT` rules
 - iptables rules flushed by something else, or `net.ipv4.ip_forward` reset to 0
 - The destination is not reachable from this server (wrong IP/port, or the destination blocks this server)
+- **Another tool also handles the port** — a DNAT/REDIRECT rule from something else (other tunnel managers, Docker, firewalld, a leftover test rule) runs in `PREROUTING` *before* the packet reaches realm/haproxy or PFM's own rule, so the tunnel looks perfect from the inside (listening, rules in place, local `nc 127.0.0.1` works) while nothing from outside ever arrives
+
+### Works locally but not from outside?
+
+Local tests never pass through `PREROUTING`, so they cannot see this. `pfm doctor <port>` checks it directly:
+
+- It lists every non-PFM NAT rule that matches the tunnel port (iptables, ip6tables and native nftables; Docker chains, port ranges and multiport lists included) with its packet counter and the exact command that removes it. PFM never deletes another tool's rules on its own — take a backup first: `iptables-save > /root/iptables.bak`
+- It compares the packets that *arrived* on the port with the ones *handed to the tunnel*. Run it again after a real client has connected. `pfm sync` (cron) keeps the previous counters and writes a `WARN` line to `/var/log/pfm.log` when a tunnel starts or stops being diverted
+
+By hand, without PFM:
+
+```bash
+iptables-save -t nat | grep -- '--dport <port>'      # who else DNATs this port?
+tcpdump -ni any "tcp port <port>" -c 10             # do packets arrive, and where do they leave again?
+```
 
 ## 📋 Requirements
 
