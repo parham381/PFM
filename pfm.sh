@@ -14,6 +14,9 @@
 #
 #══════════════════════════════════════════════════════════════
 
+# cron runs with PATH=/usr/bin:/bin, where iptables, ethtool, tc and sysctl (sbin) are not found: add the standard directories behind whatever is there
+for _d in /usr/local/sbin /usr/local/bin /usr/sbin /sbin; do case ":$PATH:" in *":$_d:"*) ;; *) PATH="${PATH:+$PATH:}$_d" ;; esac; done; export PATH; unset _d
+
 PFM_DIR="/etc/pfm"
 USERS_DIR="$PFM_DIR/users"
 PORTS_DIR="$PFM_DIR/ports"
@@ -104,7 +107,8 @@ confirm() {    # confirm "question" [y|n default] -> 0 = yes
     local q="$1" d="${2:-n}" a hint="(y/N)"
     [[ "$d" == y ]] && hint="(Y/n)"
     [[ "${PFM_YES:-0}" == 1 ]] && return 0
-    echo -ne "  ${Y}${q} ${hint}:${NC} "; read -r a
+    echo -ne "  ${Y}${q} ${hint}:${NC} "
+    read -r a || { echo ""; return 1; }              # input closed (cron, a pipe, ssh -T) is never a "yes"
     a="${a:-$d}"; [[ "$a" == y || "$a" == Y ]]
 }
 pause() { echo -ne "\n  ${GR}Enter...${NC}"; read -r; }
@@ -151,13 +155,13 @@ ensure_tool() {    # ensure_tool <command> [why] - offers to install the package
     pm=$(pkg_mgr) || { echo -e "  ${R}'$cmd' is missing and no package manager was found${NC}"; return 1; }
     pkg=$(tool_pkg "$cmd")
     confirm "'$cmd' ${why:+($why) }is not installed. Install package '$pkg' now?" y || return 1
-    echo -e "  ${GR}Installing $pkg ...${NC}"
-    case "$pm" in
-        apt-get) { timeout 180 apt-get update -qq; DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq "$pkg"; } > /dev/null 2>&1 ;;
-        dnf|yum) timeout 300 "$pm" install -y -q "$pkg" > /dev/null 2>&1 ;;
-        zypper)  timeout 300 zypper -n -q install "$pkg" > /dev/null 2>&1 ;;
-        pacman)  timeout 300 pacman -S --noconfirm --needed "$pkg" > /dev/null 2>&1 ;;
-        apk)     timeout 300 apk add -q "$pkg" > /dev/null 2>&1 ;;
+    echo -e "  ${GR}Installing $pkg (a minute or two; Ctrl+C cancels) ...${NC}"
+    case "$pm" in           # --foreground: Ctrl+C reaches the package manager instead of waiting for it to finish
+        apt-get) { timeout --foreground 180 apt-get update -qq; DEBIAN_FRONTEND=noninteractive timeout --foreground 300 apt-get install -y -qq "$pkg"; } > /dev/null 2>&1 < /dev/null ;;
+        dnf|yum) timeout --foreground 300 "$pm" install -y -q "$pkg" > /dev/null 2>&1 < /dev/null ;;
+        zypper)  timeout --foreground 300 zypper -n -q install "$pkg" > /dev/null 2>&1 < /dev/null ;;
+        pacman)  timeout --foreground 300 pacman -S --noconfirm --needed "$pkg" > /dev/null 2>&1 < /dev/null ;;
+        apk)     timeout --foreground 300 apk add -q "$pkg" > /dev/null 2>&1 < /dev/null ;;
     esac
     hash -r 2> /dev/null
     command -v "$cmd" > /dev/null 2>&1 && { echo -e "  ${G}$cmd installed${NC}"; return 0; }
@@ -1221,6 +1225,7 @@ cmd_restore() {
         [[ "$P_METHOD" != "haproxy" && "$P_BLOCKED" == "1" ]] && block_port "$port"
     done
     [[ $need_hp -eq 1 ]] && rebuild_haproxy_cfg
+    tune_sysctl_restore                # once more: the NAT rules above loaded nf_conntrack, so its net.netfilter.* settings exist only now
     # realm stays "active" even when it could not bind: give it a moment, then verify/restart
     sleep 2
     for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && realm_health_check "$(basename "$f")"; done
@@ -1250,6 +1255,10 @@ heal_rules() {
 cmd_sync() {
     sync_all; check_limits
     [[ "$(systemctl is-system-running 2>/dev/null)" == "stopping" ]] && return
+    # one run of the repair work at a time: a slow one (name lookups, a busy machine) must not pile up under the next cron run; it waits, it never skips
+    if command -v flock > /dev/null 2>&1 && exec 9> "$PFM_DIR/.sync.lock" 2> /dev/null; then
+        flock -w 60 9 || log "sync: the previous run was still busy after 60 s - continuing anyway"
+    fi
     heal_rules
     tune_heal
     # Health check all realm services + haproxy
@@ -1465,16 +1474,16 @@ probe_ping() {    # probe_ping <ip> [count] [interval]
     command -v ping > /dev/null 2>&1 || { echo "sent=0 recv=0 loss=100.00 err=noping"; return 1; }
     is_ipv6 "$host" && fam="-6"
     tmo=$(awk -v c="$count" -v i="$iv" 'BEGIN{printf "%d", c * i + 10}')
-    LC_ALL=C timeout "$tmo" ping $fam -n -c "$count" -i "$iv" -W 2 "$host" 2> /dev/null | ping_summarize "$count"
+    LC_ALL=C timeout --foreground "$tmo" ping $fam -n -c "$count" -i "$iv" -W 2 "$host" 2> /dev/null | ping_summarize "$count"
 }
 # One value per probe slot, in order: ms, or -1 for a lost packet (feeds the stability sparkline)
 probe_series() {    # probe_series <ip> <seconds> [per_second]
     local host="$1" secs="$2" ps="${3:-5}" fam="" n iv
     is_ipv6 "$host" && fam="-6"
     n=$(( secs * ps )); iv=$(awk -v p="$ps" 'BEGIN{printf "%.3f", 1 / p}')
-    LC_ALL=C timeout $(( secs + 12 )) ping $fam -n -c "$n" -i "$iv" -W 2 "$host" 2> /dev/null | awk -v N="$n" '
+    LC_ALL=C timeout --foreground $(( secs + 12 )) ping $fam -n -c "$n" -i "$iv" -W 2 "$host" 2> /dev/null | awk -v N="$n" '
         /icmp_seq=/ && /time[=<]/ { match($0, /icmp_seq=[0-9]+/); q = substr($0, RSTART + 9, RLENGTH - 9) + 0
-                                    match($0, /time[=<][0-9.]+/); t[q] = substr($0, RSTART + 5, RLENGTH - 5) + 0 }
+                                    match($0, /time[=<][0-9.]+/); if (!(q in t)) t[q] = substr($0, RSTART + 5, RLENGTH - 5) + 0 }
         END { for (i = 1; i <= N; i++) printf "%s ", (i in t) ? t[i] : "-1"; print "" }'
 }
 series_windows() {    # "<values>" <window size> -> average per window (-1 = whole window lost)
@@ -1495,10 +1504,10 @@ series_stats() {    # "<values>" -> med= spikes= (samples above max(3 x median, 
 # ── TCP handshake time to host:port (works when ICMP is filtered; proves the port is open end to end) ──
 probe_tcp() {    # probe_tcp <ip> <port> [count]
     local host="$1" port="$2" n="${3:-10}" i t0 t1 ok=0 base=999999999 b vals=""
-    for i in 1 2 3; do t0=$(now_us); timeout 3 bash -c ':'; t1=$(now_us); b=$(( t1 - t0 )); (( b < base )) && base=$b; done
+    for i in 1 2 3; do t0=$(now_us); timeout --foreground 3 bash -c ':'; t1=$(now_us); b=$(( t1 - t0 )); (( b < base )) && base=$b; done
     for ((i = 0; i < n; i++)); do
         t0=$(now_us)
-        if timeout 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2> /dev/null; then
+        if timeout --foreground 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2> /dev/null; then
             t1=$(now_us); ok=$(( ok + 1 )); vals="$vals $(( t1 - t0 - base ))"
         fi
         sleep 0.15
@@ -1509,12 +1518,14 @@ probe_tcp() {    # probe_tcp <ip> <port> [count]
               printf "ok=%d n=%d min=%.2f avg=%.2f max=%.2f jitter=%.2f\n", ok, n, mn, s / c, mx, (c > 1 ? js / (c - 1) : 0) }' <<< "$vals"
 }
 # What the kernel itself saw on a real connection: MSS, path MTU, handshake RTT, congestion control
-probe_conn_info() {    # probe_conn_info <ip> <port>
-    local host="$1" port="$2" out
+probe_conn_info() {    # probe_conn_info <ip> <port> - what the kernel saw on a connection OPENED BY THIS CALL (not another socket to the same destination)
+    local host="$1" port="$2" out dst="$1"
     command -v ss > /dev/null 2>&1 || return 1
-    out=$( exec 7<> "/dev/tcp/$host/$port" 2> /dev/null || exit 1
-           ss -tni state established "( dst $host and dport = :$port )" 2> /dev/null | head -4 ) || return 1
-    awk '/mss:/ { for (i = 1; i <= NF; i++) {
+    is_ipv6 "$host" && dst="[$host]"
+    # a SYN that is silently dropped must not hold the test up for two minutes (timeout), and a refusal must not print the address on the terminal
+    out=$(timeout --foreground 5 bash -c 'exec 2> /dev/null 7<> "/dev/tcp/$1/$2" || exit 1
+        ss -tnip state established "( dst $3 and dport = :$2 )" 2> /dev/null | awk -v pid="$$" "index(\$0, \"pid=\" pid \",\") { f = 1; next } f { print; exit }"' _ "$host" "$port" "$dst") || return 1
+    awk '{ for (i = 1; i <= NF; i++) {
                     if ($i ~ /^mss:/)  { sub(/^mss:/, "", $i);  mss = $i }
                     if ($i ~ /^pmtu:/) { sub(/^pmtu:/, "", $i); pmtu = $i }
                     if ($i ~ /^rtt:/)  { sub(/^rtt:/, "", $i);  split($i, r, "/"); rtt = r[1] }
@@ -1526,32 +1537,40 @@ probe_conn_info() {    # probe_conn_info <ip> <port>
 
 # ── Path MTU: largest packet that crosses with DF set. Uses the router's "frag needed (mtu = N)" when it
 #    is sent, and a binary search when it is not (a PMTUD black hole - the thing that stalls real TCP) ──
-_mtu_try() {    # _mtu_try <ip> <payload> -> 0 = got a reply; MTU_MSG = MTU a router/the kernel announced
-    local o fam=""; is_ipv6 "$1" && fam="-6"; MTU_MSG=""
-    o=$(LC_ALL=C timeout 6 ping $fam -n -c 2 -W 1 -M "do" -s "$2" "$1" 2>&1)
-    grep -q 'bytes from' <<< "$o" && return 0
-    MTU_MSG=$(sed -n 's/.*[Mm][Tt][Uu] *[=:] *\([0-9][0-9]*\).*/\1/p' <<< "$o" | head -1)
+_mtu_try() {    # _mtu_try <ip> <payload> [rounds] -> 0 = got a reply; MTU_MSG = MTU a router/the kernel announced.
+    local o fam="" r rounds="${3:-1}"      # Three echoes per round: ONE lost packet must never decide (it used to turn a clean path into a "black hole")
+    is_ipv6 "$1" && fam="-6"; MTU_MSG=""
+    for (( r = 0; r < rounds; r++ )); do
+        o=$(LC_ALL=C timeout --foreground 8 ping $fam -n -c 3 -i 0.2 -W 1 -M "do" -s "$2" "$1" 2>&1)
+        grep -q 'bytes from' <<< "$o" && return 0
+        MTU_MSG=$(sed -n 's/.*[Mm][Tt][Uu] *[=:] *\([0-9][0-9]*\).*/\1/p' <<< "$o" | head -1)
+        [[ -n "$MTU_MSG" ]] && return 1           # a router answered "too big": a real answer, not a lost packet
+    done
     return 1
 }
 probe_mtu() {    # probe_mtu <ip> <iface_mtu>
-    local host="$1" imtu="${2:-1500}" hdr=28 lo=100 hi maxp frag=0 cand pmtu
-    is_ipv6 "$host" && hdr=48
+    local host="$1" imtu="${2:-1500}" hdr=28 lo=100 hi maxp frag=0 cand pmtu floor=576 mid rel=""
+    is_ipv6 "$host" && { hdr=48; floor=1280; }
     command -v ping > /dev/null 2>&1 || { echo "err=noping"; return 1; }
     maxp=$(( imtu - hdr )); (( maxp > 8972 )) && maxp=8972
-    _mtu_try "$host" "$lo" || { echo "icmp=blocked iface=$imtu"; return 0; }
-    if _mtu_try "$host" "$maxp"; then echo "icmp=ok pmtu=$imtu iface=$imtu fragmsg=0 blackhole=0"; return 0; fi
+    _mtu_try "$host" "$lo" 2 || { echo "icmp=blocked iface=$imtu"; return 0; }
+    # the full-size probe gets three rounds before it counts as failed: a lost packet is not a black hole
+    if _mtu_try "$host" "$maxp" 3; then echo "icmp=ok pmtu=$imtu iface=$imtu fragmsg=0 blackhole=0"; return 0; fi
     hi=$maxp
     if [[ "$MTU_MSG" =~ ^[0-9]+$ ]] && (( MTU_MSG < imtu && MTU_MSG > hdr + lo )); then
         frag=1; cand=$MTU_MSG
-        if _mtu_try "$host" $(( cand - hdr )); then echo "icmp=ok pmtu=$cand iface=$imtu fragmsg=1 blackhole=0"; return 0; fi
+        if _mtu_try "$host" $(( cand - hdr )) 2; then echo "icmp=ok pmtu=$cand iface=$imtu fragmsg=1 blackhole=0"; return 0; fi
         hi=$(( cand - hdr ))
     fi
     while (( hi - lo > 1 )); do
-        local mid=$(( (lo + hi) / 2 ))
+        mid=$(( (lo + hi) / 2 ))
         if _mtu_try "$host" "$mid"; then lo=$mid; else hi=$mid; [[ -n "$MTU_MSG" ]] && frag=1; fi
     done
     pmtu=$(( lo + hdr ))
-    echo "icmp=ok pmtu=$pmtu iface=$imtu fragmsg=$frag blackhole=$(( frag == 0 ? 1 : 0 ))"
+    # a result a couple of bytes below the interface limit means a lost packet decided the search, not the path: look once more
+    if (( frag == 0 && pmtu >= imtu - 2 )) && _mtu_try "$host" "$maxp" 2; then echo "icmp=ok pmtu=$imtu iface=$imtu fragmsg=0 blackhole=0"; return 0; fi
+    (( pmtu < floor )) && rel=" unreliable=1"        # no real path is that small: the replies were being lost / rate-limited, so the number means nothing
+    echo "icmp=ok pmtu=$pmtu iface=$imtu fragmsg=$frag blackhole=$(( frag == 0 ? 1 : 0 ))$rel"
 }
 
 # ── Route towards a destination: egress device, its type, tunnel endpoints and encapsulation overhead ──
@@ -1563,7 +1582,7 @@ probe_route() {    # probe_route <ip>
     dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$l")
     src=$(sed -n 's/.* src \([^ ]*\).*/\1/p' <<< "$l")
     via=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<< "$l")
-    rmtu=$(sed -n 's/.* mtu \([0-9][0-9]*\).*/\1/p' <<< "$l")
+    rmtu=$(sed -n 's/.* mtu \(lock \)\{0,1\}\([0-9][0-9]*\).*/\2/p' <<< "$l")      # "mtu lock 1400" is what a pin of the assistant looks like
     devmtu=$(cat "$SYSFS_NET/$dev/mtu" 2> /dev/null)
     details=$(ip -d -o link show dev "$dev" 2> /dev/null)
     kind=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^(gre|gretap|ip6gre|ip6gretap|ipip|sit|ip6tnl|vxlan|geneve|wireguard|veth|bridge|bond|vlan|macvlan|vti|erspan|tun|tap|dummy)$/) { print $i; exit } }' <<< "$details")
@@ -1590,23 +1609,23 @@ probe_mtr() {    # probe_mtr <ip> [cycles] [tcp-port] -> one line per hop: hop|h
     is_ipv6 "$host" && fam="-6"
     args=(-n -r -w -c "$cyc" -i 0.4 $fam)
     [[ -n "$tport" ]] && args+=(-T -P "$tport")
-    LC_ALL=C timeout $(( cyc + 70 )) mtr "${args[@]}" "$host" 2> /dev/null | awk '
+    LC_ALL=C timeout --foreground $(( cyc + 70 )) mtr "${args[@]}" "$host" 2> /dev/null | awk '
         $1 ~ /^[0-9]+\.\|--$/ { h = $1; sub(/\.\|--$/, "", h); l = $3; sub(/%$/, "", l)
                                 printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n", h, $2, l, $4, $5, $6, $7, $8, $9 }'
 }
 probe_trace() {    # fallback without mtr: tracepath (hop + rtt, reports the path MTU too)
     command -v tracepath > /dev/null 2>&1 || return 1
-    LC_ALL=C timeout 40 tracepath -n "$1" 2> /dev/null | awk '
+    LC_ALL=C timeout --foreground 40 tracepath -n "$1" 2> /dev/null | awk '
         /^ *[0-9]+:/ && !/no reply/ { h = $1; sub(/:$/, "", h); gsub(/\?/, "", h); host = $2; rtt = ""
                                       for (i = 1; i <= NF; i++) if ($i ~ /ms$/) { rtt = $i; sub(/ms$/, "", rtt); break }
-                                      if (h ~ /^[0-9]+$/ && rtt != "") printf "%s|%s|?|?|%s|%s|%s|%s|0\n", h, host, rtt, rtt, rtt, rtt }'
+                                      if (h ~ /^[0-9]+$/ && rtt != "" && !(h in seen)) { seen[h] = 1; printf "%s|%s|?|?|%s|%s|%s|%s|0\n", h, host, rtt, rtt, rtt, rtt } }'
 }
 
 # ── iperf3 against the helper running on the destination (see: pfm bench-server) ──
 iperf_run() {    # iperf_run <secs> <iperf3 args...> -> its output; waits and retries while the helper is still busy with an earlier test
     local secs="$1" out try; shift
     for try in 1 2 3 4 5; do
-        out=$(LC_ALL=C timeout $(( secs + 15 )) iperf3 "$@" 2>&1)
+        out=$(LC_ALL=C timeout --foreground $(( secs + 15 )) iperf3 "$@" 2>&1)
         [[ "$out" == *"server is busy"* ]] || break
         sleep 2
     done
@@ -1635,10 +1654,10 @@ iperf_udp() {    # iperf_udp <ip> <port> <secs> <bitrate> <payload bytes> -> mbp
     awk '/receiver[ \t]*$/ && /bits\/sec/ {
              for (i = 1; i <= NF; i++) { if ($i == "Mbits/sec") m = $(i-1); if ($i == "ms") j = $(i-1); if ($i ~ /^[0-9]+\/[0-9]+$/) { split($i, a, "/"); lost = a[1]; tot = a[2] } }
          }
-         END { if (tot == "") { print "err=noresult"; exit }
-               printf "mbps=%.3f jitter=%.3f lost=%d total=%d loss=%.3f\n", m, j, lost, tot, (tot > 0 ? lost * 100 / tot : 0) }' <<< "$out"
+         END { if (tot == "" || tot + 0 <= 0) { print "err=noresult"; exit }
+               printf "mbps=%.3f jitter=%.3f lost=%d total=%d loss=%.3f\n", m, j, lost, tot, lost * 100 / tot }' <<< "$out"
 }
-iperf_peer_ok() { LC_ALL=C timeout 10 iperf3 -c "$1" -p "$2" -t 1 -f m > /dev/null 2>&1; }
+iperf_peer_ok() { LC_ALL=C timeout --foreground 10 iperf3 -c "$1" -p "$2" -t 1 -f m > /dev/null 2>&1; }
 
 # Server -> Internet baseline (not through any tunnel): tells a slow tunnel from a slow uplink
 probe_inet_speed() {
@@ -1721,25 +1740,34 @@ bn_kv() { local pre="$1" t; for t in $2; do BN["${pre}_${t%%=*}"]="${t#*=}"; don
 bn_find() { BN_FIND+=("$1|$2"); }
 bn_reco() { local r; for r in "${BN_RECO[@]}"; do [[ "${r%%|*}" == "$1" ]] && return 0; done; BN_RECO+=("$1|$2"); }
 bn_step() { BN_STEP=$((BN_STEP + 1)); printf "  ${GR}[%d/%d]${NC} %-36s" "$BN_STEP" "$BN_TOTAL" "$1"; }
-bench_kill_children() { local p; for p in $(jobs -p 2> /dev/null); do kill "$p" 2> /dev/null; done; pkill -P $$ 2> /dev/null; return 0; }
+bench_kill_children() { local p; for p in $(jobs -p 2> /dev/null); do kill "$p" 2> /dev/null; done; pkill -P $$ 2> /dev/null; bench_engine_stop; return 0; }
 
 # ── collect the facts the test is about ──
 bench_prepare() {
-    local port="$1" ip
+    local port="$1" ip virt
     BN=(); BN_FIND=(); BN_RECO=(); BN_ABORT=0
     [[ -f "$PORTS_DIR/$port" ]] || return 1
-    local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_USER="" P_PROFILE=""; source "$PORTS_DIR/$port"
+    local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_USER="" P_PROFILE="" P_BLOCKED=0; source "$PORTS_DIR/$port"
     ip="$P_DEST"
-    valid_ip "$ip" || ip=$(getent ahosts "$P_DEST" 2> /dev/null | awk '{ print $1; exit }')
+    valid_ip "$ip" || ip=$(timeout 3 getent ahosts "$P_DEST" 2> /dev/null | awk '{ print $1; exit }')
     [[ -n "$ip" ]] || return 1
     bset port "$port"; bset dest "$P_DEST"; bset ip "$ip"; bset dport "$P_DPORT"; bset method "$P_METHOD"
-    bset owner "$P_USER"; bset profile "${P_PROFILE:-balanced}"; bset ts "$(date +%s)"; bset ver "$PFM_VERSION"
+    bset owner "$P_USER"; bset profile "${P_PROFILE:-balanced}"; bset ts "$(date +%s)"; bset ver "$PFM_VERSION"; bset blocked "${P_BLOCKED:-0}"
     bn_kv r "$(probe_route "$ip")"
     [[ -n "$(bget r_dev)" ]] || return 1
+    # the MTU the kernel really uses towards this destination: a route pin of the assistant ("mtu lock N") is smaller than the interface
+    local dm rm; dm=$(bget r_devmtu 0); rm=$(bget r_routemtu 0)
+    [[ "$dm" =~ ^[0-9]+$ ]] || dm=0; [[ "$rm" =~ ^[0-9]+$ ]] || rm=0
+    if (( rm > 0 && (dm == 0 || rm < dm) )); then bset r_effmtu "$rm"; bset r_pinned 1; else bset r_effmtu "$dm"; bset r_pinned 0; fi
+    # is the tunnel itself up? (a stopped engine or a missing rule explains "0 Mbit/s live" better than any score)
+    case "$P_METHOD" in
+        realm|haproxy) engine_listening "$port" "$P_METHOD" && bset up 1 || bset up 0 ;;
+        *)             port_rules_present "$port" && bset up 1 || bset up 0 ;;
+    esac
     bset host "$(hostname -s 2> /dev/null)"
     bset os "$(. /etc/os-release 2> /dev/null; echo "${PRETTY_NAME:-$(uname -s)}")"
     bset kernel "$(uname -r)"
-    bset virt "$(systemd-detect-virt 2> /dev/null || echo none)"
+    virt=$(systemd-detect-virt 2> /dev/null); bset virt "${virt:-none}"           # on bare metal it prints "none" AND fails
     bset cpus "$(nproc 2> /dev/null || echo 1)"
     bset ram "$(awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo)"
     bset load "$(cut -d' ' -f1 /proc/loadavg)"
@@ -1751,53 +1779,62 @@ bench_prepare() {
 }
 
 # ── temporary copy of the tunnel's engine in front of the helper: shows what the engine adds ──
-bench_engine_start() {    # method ip peer_port local_port -> pid
-    local m="$1" ip="$2" pp="$3" tp="$4" pid dest="$2:$3" i cfg
+BN_ENG_PID=""; BN_ENG_CFG=""
+bench_engine_start() {    # bench_engine_start <method> <ip> <peer port> <local port> -> 0 with BN_ENG_PID set.
+    local m="$1" ip="$2" pp="$3" tp="$4" dest="$2:$3" i       # Started in THIS shell (no $( )), so a signal or Ctrl+C can find and stop it.
     is_ipv6 "$ip" && dest="[$ip]:$pp"
+    BN_ENG_PID=""; BN_ENG_CFG=""
     case "$m" in
         realm)   [[ -x "$REALM_BIN" ]] || return 1
-                 "$REALM_BIN" -l "127.0.0.1:$tp" -r "$dest" > /dev/null 2>&1 & pid=$! ;;
+                 "$REALM_BIN" -l "127.0.0.1:$tp" -r "$dest" > /dev/null 2>&1 & BN_ENG_PID=$! ;;
         haproxy) haproxy_installed || return 1
-                 cfg="/tmp/pfm-bench-ha.$tp.cfg"
-                 printf 'global\n    maxconn 4000\ndefaults\n    mode tcp\n    timeout connect 5s\n    timeout client 60s\n    timeout server 60s\n    option splice-auto\nfrontend ft\n    bind 127.0.0.1:%s\n    default_backend bk\nbackend bk\n    server s %s\n' "$tp" "$dest" > "$cfg"
-                 "$(haproxy_bin)" -f "$cfg" -db > /dev/null 2>&1 & pid=$! ;;
+                 BN_ENG_CFG=$(mktemp "${TMPDIR:-/tmp}/pfm-bench-ha.XXXXXX") || return 1
+                 printf 'global\n    maxconn 4000\ndefaults\n    mode tcp\n    timeout connect 5s\n    timeout client 60s\n    timeout server 60s\n    option splice-auto\nfrontend ft\n    bind 127.0.0.1:%s\n    default_backend bk\nbackend bk\n    server s %s\n' "$tp" "$dest" > "$BN_ENG_CFG"
+                 "$(haproxy_bin)" -f "$BN_ENG_CFG" -db > /dev/null 2>&1 & BN_ENG_PID=$! ;;
         *) return 1 ;;
     esac
-    for i in $(seq 1 25); do [[ -n "$(port_owner_name "$tp")" ]] && { echo "$pid"; return 0; }; sleep 0.1; done
-    kill "$pid" 2> /dev/null; rm -f "/tmp/pfm-bench-ha.$tp.cfg"; return 1
+    for i in $(seq 1 25); do [[ -n "$(port_owner_name "$tp")" ]] && return 0; sleep 0.1; done
+    bench_engine_stop; return 1
 }
-bench_engine_stop() { kill "$1" 2> /dev/null; sleep 0.2; kill -9 "$1" 2> /dev/null; rm -f "/tmp/pfm-bench-ha.$2.cfg"; }
+bench_engine_stop() {
+    if [[ -n "$BN_ENG_PID" ]]; then kill "$BN_ENG_PID" 2> /dev/null; sleep 0.2; kill -9 "$BN_ENG_PID" 2> /dev/null; wait "$BN_ENG_PID" 2> /dev/null; fi
+    [[ -n "$BN_ENG_CFG" ]] && rm -f "$BN_ENG_CFG"
+    BN_ENG_PID=""; BN_ENG_CFG=""; return 0
+}
 
 # ── throughput suite: needs the helper running on the destination ──
 bench_speed() {    # bench_speed <ip> <peer port>
-    local ip="$1" pp="$2" dev method tmp lp c0 c1 n0 n1 s0 s1 t0 t1
+    local ip="$1" pp="$2" dev method tmp lp c0 c1 n0 n1 s0 s1 t0 t1 ramp pcount piv sd
     dev=$(bget r_dev); method=$(bget method); tmp=$(mktemp)
+    ramp=$(bn_dur 1.5 0.4); pcount=$(bn_dur 10 4); piv=$(bn_dur 0.5 0.3); sd=$(bn_dur 8 2); bset spd_secs "$sd"
     n0=$(nic_stat "$dev"); s0=$(softnet_stat); t0=$(tcp_snmp)
     bn_kv dl1 "$(iperf_tcp "$ip" "$pp" "$(bn_dur 6 2)" 1 1)"                       # one stream = what a single download feels like
     (( BN_ABORT )) && { rm -f "$tmp"; return; }
-    c0=$(cpu_snap); ( sleep 1.5; probe_ping "$ip" 10 0.5 > "$tmp" ) & lp=$!
-    bn_kv dl4 "$(iperf_tcp "$ip" "$pp" "$(bn_dur 8 2)" 4 1)"                       # four streams = the link's capacity
+    c0=$(cpu_snap); ( sleep "$ramp"; probe_ping "$ip" "$pcount" "$piv" > "$tmp" ) & lp=$!       # pings while the line is full (after the ramp-up)
+    bn_kv dl4 "$(iperf_tcp "$ip" "$pp" "$sd" 4 1)"                                 # four streams = the link's capacity
     c1=$(cpu_snap); wait "$lp" 2> /dev/null
     bn_kv ldl "$(cat "$tmp")"; bn_kv cpu "$(cpu_diff "$c0" "$c1")"
     (( BN_ABORT )) && { rm -f "$tmp"; return; }
-    ( sleep 1.5; probe_ping "$ip" 10 0.5 > "$tmp" ) & lp=$!
-    bn_kv ul4 "$(iperf_tcp "$ip" "$pp" "$(bn_dur 8 2)" 4 0)"
+    ( sleep "$ramp"; probe_ping "$ip" "$pcount" "$piv" > "$tmp" ) & lp=$!
+    bn_kv ul4 "$(iperf_tcp "$ip" "$pp" "$sd" 4 0)"
     wait "$lp" 2> /dev/null; bn_kv lul "$(cat "$tmp")"
     (( BN_ABORT )) && { rm -f "$tmp"; return; }
-    bn_kv udp "$(iperf_udp "$ip" "$pp" "$(bn_dur 8 2)" 1M 200)"                    # game / voice-like stream
+    bn_kv udp "$(iperf_udp "$ip" "$pp" "$sd" 1M 200)"                              # game / voice-like stream
     case "$method" in
         realm|haproxy)
-            local tp pid ep0 ep1 ta tb hz
+            local tp ep0 ep1 ta tb hz e d
             tp=$(( 20000 + RANDOM % 30000 )); while [[ -n "$(port_owner_name "$tp")" ]]; do tp=$(( 20000 + RANDOM % 30000 )); done
-            pid=$(bench_engine_start "$method" "$ip" "$pp" "$tp")
-            if [[ -n "$pid" ]]; then
+            if bench_engine_start "$method" "$ip" "$pp" "$tp"; then
                 hz=$(getconf CLK_TCK 2> /dev/null || echo 100)
-                ep0=$(proc_ticks "$pid"); ta=$(now_us); c0=$(cpu_snap)
-                bn_kv eng "$(iperf_tcp 127.0.0.1 "$tp" "$(bn_dur 8 2)" 4 1)"
-                ep1=$(proc_ticks "$pid"); tb=$(now_us); c1=$(cpu_snap)
+                ep0=$(proc_ticks "$BN_ENG_PID"); ta=$(now_us); c0=$(cpu_snap)
+                bn_kv eng "$(iperf_tcp 127.0.0.1 "$tp" "$sd" 4 1)"
+                ep1=$(proc_ticks "$BN_ENG_PID"); tb=$(now_us); c1=$(cpu_snap)
                 bset eng_cpu "$(awk -v a="$ep0" -v b="$ep1" -v ta="$ta" -v tb="$tb" -v hz="$hz" 'BEGIN { d = (tb - ta) / 1e6; printf "%.0f", (d > 0 ? (b - a) / hz / d * 100 : 0) }')"
                 bn_kv engc "$(cpu_diff "$c0" "$c1")"
-                bench_engine_stop "$pid" "$tp"
+                bench_engine_stop
+                # two runs over the internet differ by 20-30% on their own: when the engine looks slow, measure the direct path once more and compare with the better one
+                e=$(bget eng_mbps 0); d=$(bget dl4_mbps 0)
+                if fl "$d" '>' 0 && fl "$e" '<' "$(awk -v d="$d" 'BEGIN { print d * 0.75 }')" && (( ! BN_ABORT )); then bn_kv dl4b "$(iperf_tcp "$ip" "$pp" "$sd" 4 1)"; fi
             fi ;;
     esac
     n1=$(nic_stat "$dev"); s1=$(softnet_stat); t1=$(tcp_snmp)
@@ -1809,13 +1846,17 @@ bench_speed() {    # bench_speed <ip> <peer port>
 }
 
 # ── the test ──
-bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none]
-    local port="$1" mode="${2:-quick}" pport="${3:-0}" ip dport method dev t_start ser win secs
+bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1 = also measure this server's own internet speed]
+    local port="$1" mode="${2:-quick}" pport="${3:-0}" inet="${4:-0}" ip dport method dev t_start ser win secs imtu
     bench_prepare "$port" || { echo -e "  ${R}Cannot start the test: tunnel not found, destination does not resolve, or no route to it.${NC}"; return 1; }
     ip=$(bget ip); dport=$(bget dport); method=$(bget method); dev=$(bget r_dev)
+    # an optional tool is asked for BEFORE the numbered steps start, where the question can be seen and answered
+    command -v mtr > /dev/null 2>&1 || ensure_tool mtr "route analysis - without it tracepath is used" || true
     t_start=$(date +%s); bset mode "$mode"; bset peer "$pport"
     BN_STEP=0; BN_TOTAL=5; [[ "$mode" == full ]] && BN_TOTAL=6
     trap 'BN_ABORT=1; bench_kill_children' INT
+    trap 'bench_kill_children; trap - INT TERM HUP; exit 143' TERM
+    trap 'bench_kill_children; trap - INT TERM HUP; exit 129' HUP
     echo -e "\n  ${B}${W}Bench Test${NC}  ${GR}:${port} -> $(bget dest):${dport}  [${method}]  mode: ${mode}${NC}\n" | bn_out
 
     # 1) latency, jitter, loss, stability (one run feeds numbers and sparkline)
@@ -1836,26 +1877,27 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none]
     # 2) TCP handshake to the destination port
     bn_step "TCP handshake to ${dport}"
     bn_kv t "$(probe_tcp "$ip" "$dport" 10)"
-    bn_kv ci "$(probe_conn_info "$ip" "$dport")"
+    [[ "$(bget t_ok 0)" -gt 0 ]] && bn_kv ci "$(probe_conn_info "$ip" "$dport")"      # nothing to look at when no handshake succeeded (and no minutes lost on a dropped SYN)
     if [[ "$(bget t_ok 0)" -gt 0 ]]; then echo -e "avg $(bget t_avg) ms   $(bget t_ok)/$(bget t_n) ok"
     else echo -e "${Y}port does not accept TCP${NC}"; fi
     (( BN_ABORT )) && { bench_aborted; return 130; }
 
-    # 3) path MTU
+    # 3) path MTU (against the MTU the kernel really uses towards this destination: a pin of the assistant counts)
     bn_step "Path MTU"
     if [[ "$(bget icmp_ok 0)" == 1 ]]; then
-        bn_kv m "$(probe_mtu "$ip" "$(bget r_devmtu 1500)")"
+        imtu=$(bget r_effmtu 0); [[ "$imtu" =~ ^[0-9]+$ ]] && (( imtu >= 576 )) || imtu=1500
+        bn_kv m "$(probe_mtu "$ip" "$imtu")"
         echo -e "path $(bget m_pmtu "?") / interface $(bget m_iface "?")   black-hole: $([[ "$(bget m_blackhole 0)" == 1 ]] && echo YES || echo no)"
     else bset m_icmp blocked; echo -e "${GR}skipped (ICMP filtered)${NC}"; fi
     (( BN_ABORT )) && { bench_aborted; return 130; }
 
     # 4) route
     bn_step "Route (MTR)"
-    command -v mtr > /dev/null 2>&1 || ensure_tool mtr "route analysis" > /dev/null 2>&1
     local mt=""
     if command -v mtr > /dev/null 2>&1; then
         if [[ "$(bget icmp_ok 0)" == 1 ]]; then mt=$(probe_mtr "$ip" 10); else mt=$(probe_mtr "$ip" 10 "$dport"); fi
-    else mt=$(probe_trace "$ip"); fi
+        bset mtr_tool mtr
+    else mt=$(probe_trace "$ip"); bset mtr_tool tracepath; fi
     bset mtr "$mt"
     if [[ -n "$mt" ]]; then echo -e "$(wc -l <<< "$mt") hop(s)"; else echo -e "${GR}no data${NC}"; fi
     (( BN_ABORT )) && { bench_aborted; return 130; }
@@ -1868,25 +1910,34 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none]
 
     # 6) throughput (full mode)
     if [[ "$mode" == full ]]; then
+        if (( pport > 0 )) && { [[ "$(bget conns 0)" -gt 0 ]] || fl "$(bget lv_down 0)" '>' 1 || fl "$(bget lv_up 0)" '>' 1; }; then
+            echo -e "\n  ${Y}$(bget conns 0) connection(s) use this tunnel right now ($(bget lv_down 0) down / $(bget lv_up 0) up Mbit/s).${NC}"
+            echo -e "  ${GR}The speed test fills the line for about 40 seconds (up to ~4 GB of traffic at 1 Gbit/s) and slows them down.${NC}"
+            confirm "Run the speed test now?" y || { pport=0; bset peer 0; }
+            echo ""
+        fi
         if (( pport > 0 )); then
             bn_step "Speed test (iperf3, ~60s)"
             echo ""
             bench_speed "$ip" "$pport"
-            echo -e "         down $(bget dl4_mbps "-") Mbit/s   up $(bget ul4_mbps "-") Mbit/s"
-        else
+            if [[ -n "$(bget dl4_mbps)" ]]; then echo -e "         down $(bget dl4_mbps) Mbit/s   up $(bget ul4_mbps "-") Mbit/s"
+            else echo -e "         ${Y}the speed test did not produce a result${NC}"; fi
+        elif (( inet )); then
             bn_step "Server -> Internet baseline"
             bn_kv inet "$(probe_inet_speed)"
             if [[ -n "$(bget inet_down)" ]]; then echo -e "down $(bget inet_down) Mbit/s   up $(bget inet_up) Mbit/s"
             else echo -e "${GR}unreachable${NC}"; fi
+        else
+            bn_step "Speed test"; echo -e "${GR}skipped (needs the helper on the destination)${NC}"
         fi
     fi
-    trap - INT
+    trap - INT TERM HUP
     (( BN_ABORT )) && { bench_aborted; return 130; }
     bset secs "$(( $(date +%s) - t_start ))"
     bench_analyze
     return 0
 }
-bench_aborted() { trap - INT; echo -e "\n  ${Y}Test cancelled.${NC}"; }
+bench_aborted() { trap - INT TERM HUP; bench_engine_stop; echo -e "\n  ${Y}Test cancelled.${NC}"; }
 
 # ── scoring ──
 sc_latency() { awk -v v="$1" 'BEGIN { print (v <= 40 ? 100 : v <= 80 ? 90 : v <= 150 ? 75 : v <= 250 ? 55 : 35) }'; }
@@ -1903,20 +1954,40 @@ rate_dot() {
     else echo -e "${R}● BAD${NC}"; fi
 }
 grade_of() { awk -v s="$1" 'BEGIN { print (s >= 90 ? "A" : s >= 80 ? "B" : s >= 65 ? "C" : s >= 50 ? "D" : "F") }'; }
-verdict_word() { case "$1" in 2) echo -e "${G}GREAT${NC}" ;; 1) echo -e "${Y}OK${NC}" ;; *) echo -e "${R}POOR${NC}" ;; esac; }
+verdict_word() { case "$1" in 2) echo -e "${G}GREAT${NC}" ;; 1) echo -e "${Y}OK${NC}" ;; -1) echo -e "${GR}n/a${NC}" ;; *) echo -e "${R}POOR${NC}" ;; esac; }
 
 # ── analysis: findings in plain words, each with the Optimization Assistant action that addresses it ──
 bench_analyze() {
     BN_FIND=(); BN_RECO=()
-    local method icmp rtt jit loss bloat dl1 dl4 cc prof dev kind
+    local method icmp rtt jit loss lost=0 sent=0 lsig=0 lsrc=icmp unit bloat dl1 dl4 cc prof dev kind tcp_ok tcp_n up blocked
     method=$(bget method); icmp=$(bget icmp_ok 0); cc=$(bget cc); prof=$(bget profile); dev=$(bget r_dev); kind=$(bget r_kind)
-    if [[ "$icmp" == 1 ]]; then rtt=$(bget p_avg); jit=$(bget p_jitter); loss=$(bget p_loss)
-    else rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter); loss=""; fi
-    local tcp_ok; tcp_ok=$(bget t_ok 0)
+    tcp_ok=$(bget t_ok 0); tcp_n=$(bget t_n 0); up=$(bget up 1); blocked=$(bget blocked 0)
+    # loss: HOW MANY probes were lost decides how serious it is (one lost ping of 40 is 2.5% and still means nothing)
+    if [[ "$icmp" == 1 ]]; then
+        rtt=$(bget p_avg); jit=$(bget p_jitter); loss=$(bget p_loss); sent=$(bget p_sent 0); lost=$(( sent - $(bget p_recv 0) ))
+        if (( lost >= 3 )) || (( $(bget p_lossev 0) >= 2 )); then lsig=1; fi
+    else
+        rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter); loss=""; lsrc=tcp
+        if (( tcp_ok > 0 && tcp_n > 0 )); then               # no ICMP: failed handshakes are the only loss signal
+            sent=$tcp_n; lost=$(( tcp_n - tcp_ok )); loss=$(awk -v n="$tcp_n" -v k="$tcp_ok" 'BEGIN { printf "%.1f", (n - k) * 100 / n }')
+            (( lost >= 3 )) && lsig=1
+        fi
+    fi
+    unit="probes"; [[ "$lsrc" == tcp ]] && unit="TCP connection attempts"
+    bset l_cnt "$lost"; bset l_sent "$sent"; bset l_sig "$lsig"; bset l_src "$lsrc"
+    if [[ -n "$loss" ]]; then
+        if (( lsig )); then bset l_eff "$loss"; else bset l_eff "$(awk -v l="$loss" 'BEGIN { print (l > 0.5 ? 0.5 : l) }')"; fi
+    fi
 
+    # is the tunnel itself in order?
+    if [[ "$blocked" == 1 ]]; then bn_find crit "This tunnel is BLOCKED in PFM: nobody can connect through it. (The test below only measures the leg from this server to the destination.)"
+    elif [[ "$up" == 0 ]]; then
+        bn_find crit "The tunnel is not running: $([[ "$method" == iptables ]] && echo "its NAT rule is missing" || echo "$method is not listening on :$(bget port)"). Run: pfm restore, then pfm doctor $(bget port). (The test below only measures the leg from this server to the destination.)"
+    fi
     # reachability
     if [[ "$icmp" != 1 && "$tcp_ok" == 0 ]]; then
-        bn_find crit "The destination does not answer at all (ICMP and TCP port $(bget dport)). It is down, the IP/port is wrong, or a firewall/provider blocks this server."
+        bset nomeasure 1
+        bn_find crit "Nothing answered - neither ICMP nor TCP port $(bget dport). The destination is down, the IP/port is wrong or a firewall blocks this server. If it only carries UDP (WireGuard, QUIC, games), the Bench Test cannot probe it from here."
     elif [[ "$tcp_ok" == 0 ]]; then
         bn_find warn "TCP port $(bget dport) does not accept connections. Normal for UDP-only services (WireGuard, QUIC, games); otherwise the service is down or filtered."
     elif [[ "$icmp" != 1 ]]; then
@@ -1925,14 +1996,19 @@ bench_analyze() {
 
     # loss
     if [[ -n "$loss" ]]; then
-        if fl "$loss" '>=' 2; then
-            bn_find crit "Packet loss ${loss}% towards the destination. TCP speed collapses with loss; games and calls break up. Check the route below to see where it starts."
+        if (( lsig )) && fl "$loss" '>=' 2; then
+            bn_find crit "Packet loss ${loss}% towards the destination ($lost of $sent $unit). TCP speed collapses with loss; games and calls break up. Check the route below to see where it starts."
             [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR keeps TCP fast on lossy paths (cubic backs off hard)"
-        elif fl "$loss" '>=' 0.5; then
-            bn_find warn "Packet loss ${loss}% - noticeable for gaming/calls and it lowers single-download speed."
+        elif (( lsig )) && fl "$loss" '>=' 0.5; then
+            bn_find warn "Packet loss ${loss}% ($lost of $sent $unit) - noticeable for gaming/calls and it lowers single-download speed."
             [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR tolerates loss much better than cubic"
-        else bn_find ok "No meaningful packet loss (${loss}%)."; fi
-        if fl "$(bget p_maxburst 0)" '>=' 5 && fl "$loss" '>' 0; then
+        elif (( lost > 0 )); then
+            bn_find info "$lost of $sent $unit got no answer (${loss}%). That is too few to call it a pattern - a rate-limited ping or a single drop looks the same. The Full test (60 s) settles it."
+        else bn_find ok "No packet loss ($sent $unit answered)."; fi
+        if [[ "$icmp" == 1 ]] && (( lsig )) && (( tcp_n >= 5 && tcp_ok == tcp_n )); then
+            bn_find info "All $tcp_n TCP connections to port $(bget dport) succeeded, so part of the ICMP loss may be the destination rate-limiting ping rather than real packet loss."
+        fi
+        if (( lsig )) && fl "$(bget p_maxburst 0)" '>=' 5; then
             bn_find warn "Loss comes in bursts (up to $(bget p_maxburst) packets in a row): a link flap or a congested hop, not random noise."
         fi
     fi
@@ -1940,19 +2016,23 @@ bench_analyze() {
     if [[ -n "$jit" ]]; then
         if fl "$jit" '>=' 30; then
             bn_find crit "Jitter ${jit} ms: very unstable latency - gaming and voice/video calls will stutter."
-            [[ "$prof" != gaming ]] && bn_reco profile:gaming "stabilise latency for this tunnel"
+            [[ "$prof" != gaming && "$method" != iptables ]] && bn_reco profile:gaming "stabilise latency for this tunnel"
         elif fl "$jit" '>=' 10; then
             bn_find warn "Jitter ${jit} ms: fine for browsing/streaming, noticeable in gaming."
-            [[ "$prof" != gaming ]] && bn_reco profile:gaming "lower jitter for this tunnel"
+            [[ "$prof" != gaming && "$method" != iptables ]] && bn_reco profile:gaming "lower jitter for this tunnel"
         fi
     fi
     local sp; sp=$(bget st_spikes 0)
     if fl "$sp" '>=' 4; then bn_find warn "$sp latency spike$( ((sp == 1)) || echo s) during the test (a few times higher than normal): bursts of congestion on the path."; fi
     if [[ -n "$rtt" ]] && fl "$rtt" '>=' 250; then bn_find info "Latency ${rtt} ms is high - the path is long or indirect. Check the route for a detour."; fi
 
-    # MTU
-    local pm im bh
-    pm=$(bget m_pmtu); im=$(bget m_iface); bh=$(bget m_blackhole 0)
+    # MTU (compared with what the kernel really uses towards this destination)
+    local pm im bh pinned dm
+    pm=$(bget m_pmtu); im=$(bget m_iface); bh=$(bget m_blackhole 0); pinned=$(bget r_pinned 0); dm=$(bget r_devmtu)
+    if [[ "$(bget m_unreliable 0)" == 1 ]]; then
+        bn_find info "The MTU measurement was not reliable (replies were lost or rate-limited), so it is ignored."
+        BN[m_pmtu]=""; BN[m_blackhole]=0; pm=""; bh=0
+    fi
     if [[ "$bh" == 1 ]]; then
         bn_find crit "MTU black hole: packets over ${pm} bytes vanish and the network never says so. Big TCP transfers stall while pings and small requests work."
         bn_reco mtu "find and apply the MTU that really crosses this path"
@@ -1961,59 +2041,94 @@ bench_analyze() {
         bn_find warn "Path MTU is ${pm} but ${dev} uses ${im}: oversize packets get fragmented or need an extra round trip."
         bn_reco mtu "match the interface MTU to the ${pm}-byte path"
         [[ "$method" == iptables ]] && bn_reco mss "clamp TCP MSS to the path MTU"
-    elif [[ "$pm" =~ ^[0-9]+$ ]]; then bn_find ok "MTU is consistent (path ${pm} = interface ${im})."; fi
-    if [[ "$kind" =~ ^(gre|gretap|ipip|sit|wireguard|vxlan|ip6gre|ip6tnl)$ && "$method" == iptables && ! "$bh" == 1 ]]; then
-        bn_reco mss "tunnel device ($kind) + kernel NAT: clamping TCP MSS prevents oversize packets"
+    elif [[ "$pm" =~ ^[0-9]+$ ]]; then
+        if [[ "$pinned" == 1 ]]; then bn_find ok "MTU is consistent (path ${pm} = the MTU pinned on the route; ${dev} itself allows ${dm}). The pin limits the probes, so a better path would not show here - MTU auto-tune re-checks without it."
+        else bn_find ok "MTU is consistent (path ${pm} = interface ${im})."; fi
+    fi
+    if [[ "$kind" =~ ^(gre|gretap|ipip|sit|wireguard|vxlan|ip6gre|ip6gretap|ip6tnl|geneve)$ && "$method" == iptables && ! "$bh" == 1 ]]; then
+        bn_reco mss "tunnel device ($kind) + kernel NAT: clamp the TCP MSS"
     fi
 
     # speed suite
     dl1=$(bget dl1_mbps); dl4=$(bget dl4_mbps)
+    if (( $(bget peer 0) > 0 )) && [[ -z "$dl4" ]]; then
+        bn_find warn "The speed test could not run ($(bget dl4_err "no result from iperf3")). Check that the helper still runs on the destination and that TCP and UDP port $(bget peer) are open to this server."
+    fi
     if [[ -n "$dl4" ]]; then
-        local lat_dl lat_ul
-        lat_dl=$(awk -v l="$(bget ldl_avg 0)" -v i="${rtt:-0}" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
-        lat_ul=$(awk -v l="$(bget lul_avg 0)" -v i="${rtt:-0}" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
-        bloat=$(awk -v a="$lat_dl" -v b="$lat_ul" 'BEGIN { print (a > b ? a : b) }'); bset bloat "$bloat"
-        if fl "$bloat" '>=' 300; then
-            bn_find crit "Bufferbloat: latency jumps by +$(fmt0 "$bloat") ms while the line is busy. During any big download everything else lags."
-        elif fl "$bloat" '>=' 100; then bn_find warn "Latency rises by +$(fmt0 "$bloat") ms under load (bufferbloat)."
-        elif fl "$bloat" '>=' 30; then bn_find info "Latency rises by +$(fmt0 "$bloat") ms under load - acceptable."
-        else bn_find ok "Latency stays flat under load (+$(fmt0 "$bloat") ms)."; fi
-        if fl "$bloat" '>=' 100; then
-            [[ "$cc" != bbr ]] && bn_reco bbr "BBR + fq keep queues short while the line is busy"
-            [[ "$prof" != gaming ]] && bn_reco profile:gaming "short queues and quick ACKs for latency-sensitive use"
+        # latency under load: only pings that really came back count; the tail is compared with the idle tail (jitter cancels out)
+        local bl_dl="" bl_ul="" ld lu
+        ld=$(bget ldl_recv 0); lu=$(bget lul_recv 0)
+        (( ld > 0 )) && bl_dl=$(awk -v l="$(bget ldl_p95 0)" -v i="$(bget p_p95 "${rtt:-0}")" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
+        (( lu > 0 )) && bl_ul=$(awk -v l="$(bget lul_p95 0)" -v i="$(bget p_p95 "${rtt:-0}")" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
+        bset bl_dl "$bl_dl"; bset bl_ul "$bl_ul"
+        if [[ "$icmp" == 1 ]] && { (( ld == 0 )) || (( lu == 0 )); } && (( $(bget ldl_sent 0) + $(bget lul_sent 0) > 0 )); then
+            bset load_lost 1
+            bn_find crit "No ping got through while the line was busy ($( (( ld == 0 )) && echo download )$( (( ld == 0 && lu == 0 )) && echo " and ")$( (( lu == 0 )) && echo upload )): the connection is saturated so badly that everything else stops - or the destination rate-limits ping under load."
+            [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR + fq keep queues short while the line is busy"
+        fi
+        if [[ -n "$bl_dl$bl_ul" ]]; then
+            bloat=$(awk -v a="${bl_dl:-0}" -v b="${bl_ul:-0}" 'BEGIN { print (a > b ? a : b) }'); bset bloat "$bloat"
+            if fl "$bloat" '>=' 300; then
+                bn_find crit "Bufferbloat: latency jumps by +$(fmt0 "$bloat") ms while the line is busy. During any big download everything else lags."
+            elif fl "$bloat" '>=' 100; then bn_find warn "Latency rises by +$(fmt0 "$bloat") ms under load (bufferbloat)."
+            elif fl "$bloat" '>=' 30; then bn_find info "Latency rises by +$(fmt0 "$bloat") ms under load - acceptable."
+            else bn_find ok "Latency stays flat under load (+$(bn_ms "$bloat") ms)."; fi
+            if fl "$bloat" '>=' 100; then
+                [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR + fq keep queues short while the line is busy"
+                [[ "$prof" != gaming && "$method" != iptables ]] && bn_reco profile:gaming "short queues and quick ACKs for latency-sensitive use"
+            fi
         fi
         if [[ -n "$dl1" ]] && fl "$dl4" '>' 20 && fl "${rtt:-0}" '>=' 5 && fl "$dl1" '<' "$(awk -v v="$dl4" 'BEGIN { print v * 0.35 }')"; then
-            bn_find warn "One connection reaches only $(bn_mbps "$dl1") while 4 together reach $(bn_mbps "$dl4"): single downloads are held back by loss or too-small TCP windows."
-            bn_reco buffers "bigger TCP windows for the latency of this path"
-            [[ "$cc" != bbr ]] && bn_reco bbr "BBR fills the pipe with a single connection"
+            if [[ "$method" == iptables ]]; then
+                bn_find info "One connection reaches only $(bn_mbps "$dl1") while 4 together reach $(bn_mbps "$dl4"): a single TCP stream is limited on this path (latency / loss). With kernel NAT the window is set by the user's device and the destination, not by this server - nothing to tune here."
+            else
+                bn_find warn "One connection reaches only $(bn_mbps "$dl1") while 4 together reach $(bn_mbps "$dl4"): single downloads are held back by loss or too-small TCP windows."
+                bn_reco buffers "bigger TCP windows for the latency of this path"
+                [[ "$cc" != bbr ]] && bn_reco bbr "BBR fills the pipe with a single connection"
+            fi
         fi
-        local ratio; ratio=$(awk -v e="$(bget eng_mbps 0)" -v d="$dl4" 'BEGIN { print (d > 0 ? e * 100 / d : 0) }')
-        bset eng_ratio "$ratio"
+        local ratio dbest ecpu engflag=0; dbest=$(awk -v a="$dl4" -v b="$(bget dl4b_mbps 0)" 'BEGIN { print (b + 0 > a + 0 ? b : a) }')
+        ratio=$(awk -v e="$(bget eng_mbps 0)" -v d="$dbest" 'BEGIN { print (d > 0 ? e * 100 / d : 0) }')
+        bset eng_ratio "$ratio"; ecpu=$(bget eng_cpu 0)
         if [[ -n "$(bget eng_mbps)" ]]; then
             if fl "$ratio" '<' 75; then
-                bn_find warn "The $method engine delivers only $(fmt0 "$ratio")% of the direct speed - the forwarder itself is the bottleneck."
-                bn_reco engine "try the other engine for this tunnel (iptables = no userspace copy)"
+                if fl "$ecpu" '>=' 80 || fl "$(bget engc_max 0)" '>=' 90; then
+                    engflag=1
+                    bn_find warn "The $method engine delivers only $(fmt0 "$ratio")% of the direct speed and its CPU is saturated (${ecpu}% of a core): the forwarder itself is the bottleneck."
+                    bn_reco engine "try the other engine (iptables: no userspace copy)"
+                else
+                    bn_find info "The $method engine reached only $(fmt0 "$ratio")% of the direct speed in this run, but its CPU was not saturated (${ecpu}%), so this is probably the variation of the internet path. Run the test again before drawing conclusions."
+                fi
             elif fl "$ratio" '<' 90; then bn_find info "The $method engine costs some speed ($(fmt0 "$ratio")% of the direct speed gets through)."
             else bn_find ok "The $method engine adds almost nothing ($(fmt0 "$ratio")% of direct speed)."; fi
         fi
-        if fl "$(bget cpu_max 0)" '>=' 90 || fl "$(bget engc_max 0)" '>=' 90; then
-            bn_find warn "One CPU core hit 100% ($(bget cpu_maxcpu)): forwarding is CPU-bound, more link speed will not help."
-            bn_reco nic "spread packet processing over all cores (RPS) and check offloads"
+        local sirq cmax; sirq=$(bget cpu_softirq 0); cmax=$(bget cpu_max 0)
+        if fl "$cmax" '>=' 90 && fl "$sirq" '>=' 40; then
+            bn_find warn "Packet processing saturates one CPU core ($(bget cpu_maxcpu): ${cmax}% busy, ${sirq}% of it in network interrupts): the server, not the link, limits the speed."
+            bn_reco nic "spread packets over all cores (RPS), check offloads"
+        elif (( engflag )); then :                               # the engine finding above already explains the busy core
+        elif [[ -n "$(bget eng_cpu)" ]] && fl "$ecpu" '>=' 90; then
+            bn_find warn "The $method process alone uses ${ecpu}% of a CPU core: a single-threaded forwarder is the limit, more link speed will not help."
+            bn_reco engine "try the other engine (iptables: no userspace copy)"
+        elif fl "$cmax" '>=' 90; then
+            bn_find info "One CPU core ($(bget cpu_maxcpu)) was fully busy during the speed test. That can be the speed-test client itself (iperf3 older than 3.16 uses one thread), so it is no proof that forwarding is the limit."
         fi
-        if fl "$(bget dl4_retr 0)" '>=' 500; then
-            bn_find warn "$(bget dl4_retr) TCP retransmissions in the download test: packets are being dropped on the path or in a full queue."
+        local rpct; rpct=$(awk -v r="$(bget dl4_retr 0)" -v m="$dl4" -v s="$(bget spd_secs 8)" 'BEGIN { segs = m * 1e6 / 8 * s / 1448; printf "%.2f", (segs > 0 ? r * 100 / segs : 0) }')
+        if fl "$rpct" '>=' 1; then
+            bn_find warn "$(bget dl4_retr) TCP retransmissions in the download test (${rpct}% of the segments): packets are being dropped on the path or in a full queue."
         fi
         if [[ -n "$(bget udp_loss)" ]]; then
             if fl "$(bget udp_loss)" '>=' 0.5 || fl "$(bget udp_jitter 0)" '>=' 8; then
                 bn_find warn "Game-like UDP stream: loss $(bget udp_loss)%, jitter $(bget udp_jitter) ms."
-                [[ "$prof" != gaming ]] && bn_reco profile:gaming "tune the tunnel for UDP/latency use"
+                [[ "$prof" != gaming && "$method" != iptables ]] && bn_reco profile:gaming "tune the tunnel for UDP/latency use"
             else bn_find ok "UDP stream is clean (loss $(bget udp_loss)%, jitter $(bget udp_jitter) ms)."; fi
         fi
-        if fl "$(bget nic_drops 0)" '>' 0 || fl "$(bget softnet_drops 0)" '>' 0; then
-            bn_find warn "The server dropped packets itself during the test (NIC $(bget nic_drops), backlog $(bget softnet_drops)): its receive queues are too small or one core is overloaded."
+        local nd; nd=$(( $(bget nic_drops 0) + $(bget softnet_drops 0) ))
+        if (( nd >= 100 )); then
+            bn_find warn "The server dropped $nd packets itself during the test (NIC $(bget nic_drops), backlog $(bget softnet_drops)): its receive queues are too small or one core is overloaded."
             bn_reco nic "bigger ring/backlog and RPS"
-        fi
-        if fl "$(bget softnet_squeeze 0)" '>' 0; then bn_reco nic "CPU ran out of packet-processing budget during the test"; fi
+        elif (( nd > 0 )); then bn_find info "The server's own queues dropped $nd packet(s) during the test - harmless at this level."; fi
+        if fl "$(bget softnet_squeeze 0)" '>=' 100; then bn_reco nic "CPU ran out of packet-processing budget during the test"; fi
     fi
 
     # host
@@ -2023,12 +2138,12 @@ bench_analyze() {
     if (( ctp >= 70 )); then bn_find warn "Connection tracking is ${ctp}% full: new connections will be dropped when it reaches 100%."; bn_reco conntrack "raise the connection-tracking limit"; fi
     if fl "$(bget load 0)" '>' "$(bget cpus 1)"; then bn_find warn "Server load ($(bget load)) is above its CPU count ($(bget cpus)): the machine itself is busy."; fi
     if [[ "$method" != iptables && "$cc" != bbr ]]; then
-        [[ "$(sys_get net.ipv4.tcp_available_congestion_control)" == *bbr* || -e /sys/module/tcp_bbr ]] && bn_reco bbr "this tunnel terminates TCP on the server; BBR is faster than ${cc:-cubic} on long/lossy paths"
+        [[ "$(sys_get net.ipv4.tcp_available_congestion_control)" == *bbr* || -e /sys/module/tcp_bbr ]] && bn_reco bbr "this engine terminates TCP here: BBR beats ${cc:-cubic} on long or lossy paths"
     fi
     if [[ "$method" == iptables && "$cc" != bbr ]]; then bn_find info "Congestion control is ${cc:-?}; it does not affect iptables-forwarded connections (the kernel only NATs them)."; fi
     local need
     need=$(awk -v r="${rtt:-100}" -v m="${dl4:-1000}" 'BEGIN { if (m < 100) m = 100; printf "%.0f", 2 * m * 1e6 / 8 * r / 1000 }')
-    if [[ "$(bget rmem_max)" =~ ^[0-9]+$ ]] && (( $(bget rmem_max) * 5 < need * 4 )) && fl "${rtt:-0}" '>=' 60; then      # a real shortfall (>25%), not a rounding difference
+    if [[ "$method" != iptables && "$(bget rmem_max)" =~ ^[0-9]+$ ]] && (( $(bget rmem_max) * 5 < need * 4 )) && fl "${rtt:-0}" '>=' 60; then      # a real shortfall (>25%), not a rounding difference
         bn_find info "TCP receive window limit ($(awk -v v="$(bget rmem_max)" 'BEGIN { printf "%.1f", v / 1048576 }') MB) is below what this latency needs ($(awk -v v="$need" 'BEGIN { printf "%.1f", v / 1048576 }') MB) for full speed."
         bn_reco buffers "raise TCP buffers to cover latency x bandwidth"
     fi
@@ -2037,13 +2152,11 @@ bench_analyze() {
 
 bench_score() {
     local w=0 t=0 s rtt jit loss
-    if [[ "$(bget icmp_ok 0)" == 1 ]]; then rtt=$(bget p_avg); jit=$(bget p_jitter); loss=$(bget p_loss)
-    else
-        rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter)
-        loss=$(awk -v n="$(bget t_n 0)" -v k="$(bget t_ok 0)" 'BEGIN { if (n > 0) printf "%.1f", (n - k) * 100 / n }')      # no ICMP: failed handshakes are the only loss signal
-    fi
-    if [[ "$(bget icmp_ok 0)" != 1 && "$(bget t_ok 0)" == 0 ]]; then      # nothing answers: there is nothing to grade
-        bset score 0; bset grade F; bset v_game 0; bset v_stream 0; bset v_daily 0; bset v_calls 0; return
+    if [[ "$(bget icmp_ok 0)" == 1 ]]; then rtt=$(bget p_avg); jit=$(bget p_jitter)
+    else rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter); fi
+    loss=$(bget l_eff)                     # the loss figure the findings use: ONE lost probe is damped to 0.5%, three or more count in full
+    if [[ "$(bget nomeasure 0)" == 1 ]]; then      # nothing answers: there is nothing to grade (not "0 out of 100": it may simply be a UDP-only service)
+        bset score ""; bset grade "-"; bset v_game -1; bset v_stream -1; bset v_daily -1; bset v_calls -1; return
     fi
     add() { t=$(awk -v t="$t" -v s="$1" -v w="$2" 'BEGIN { print t + s * w }'); w=$((w + $2)); }
     [[ -n "$rtt" ]] && { s=$(sc_latency "$rtt"); bset sc_lat "$s"; add "$s" 20; }
@@ -2052,27 +2165,34 @@ bench_score() {
     local pm im; pm=$(bget m_pmtu); im=$(bget m_iface)
     if [[ "$(bget m_blackhole 0)" == 1 ]]; then bset sc_mtu 20; add 20 10
     elif [[ "$pm" =~ ^[0-9]+$ && "$im" =~ ^[0-9]+$ ]]; then (( pm < im )) && s=75 || s=100; bset sc_mtu "$s"; add "$s" 10; fi
-    [[ -n "$(bget bloat)" ]] && { s=$(sc_bloat "$(bget bloat)"); bset sc_bloat "$s"; add "$s" 15; }
+    if [[ "$(bget load_lost 0)" == 1 ]]; then bset sc_bloat 15; add 15 15           # nothing got through under load: the worst answer, not a missing one
+    elif [[ -n "$(bget bloat)" ]]; then s=$(sc_bloat "$(bget bloat)"); bset sc_bloat "$s"; add "$s" 15; fi
     [[ -n "$(bget dl4_mbps)" ]] && { s=$(sc_tput "$(bget dl4_mbps)"); bset sc_tput "$s"; add "$s" 10; }
     unset -f add
     (( w > 0 )) && bset score "$(awk -v t="$t" -v w="$w" 'BEGIN { printf "%.0f", t / w }')" || bset score 0
     # a chain is as strong as its weakest link: a serious problem caps the grade however good the rest is
     local cap=100 capr="" bl; bl=$(bget bloat)
     capf() { fl "$cap" '>' "$1" && { cap=$1; capr="$2"; }; return 0; }
-    [[ -n "$loss" ]] && { fl "$loss" '>=' 1 && capf 78 "packet loss"; fl "$loss" '>=' 2 && capf 60 "packet loss"; fl "$loss" '>=' 5 && capf 40 "packet loss"; }
+    if [[ -n "$loss" && "$(bget l_sig 0)" == 1 ]]; then      # a handful of lost probes is not a reason to cap anything
+        fl "$loss" '>=' 1 && capf 78 "packet loss"; fl "$loss" '>=' 2 && capf 60 "packet loss"; fl "$loss" '>=' 5 && capf 40 "packet loss"
+    fi
     [[ -n "$jit" ]] && { fl "$jit" '>=' 20 && capf 75 jitter; fl "$jit" '>=' 30 && capf 65 jitter; fl "$jit" '>=' 40 && capf 55 jitter; }
     [[ -n "$bl" ]] && { fl "$bl" '>=' 100 && capf 80 bufferbloat; fl "$bl" '>=' 300 && capf 65 bufferbloat; }
+    [[ "$(bget load_lost 0)" == 1 ]] && capf 65 "no reply under load"
     [[ "$(bget m_blackhole 0)" == 1 ]] && capf 50 "MTU black hole"
+    [[ "$(bget blocked 0)" == 1 || "$(bget up 1)" == 0 ]] && capf 40 "tunnel not running"
     unset -f capf
     if fl "$(bget score)" '>' "$cap"; then bset score_raw "$(bget score)"; bset score "$cap"; bset score_cap "$capr"; fi
     bset grade "$(grade_of "$(bget score)")"
-    # what the tunnel is good for
+    # what the tunnel is good for (-1 = cannot be judged from what was measured)
     local l="${rtt:-999}" j="${jit:-99}" ls="${loss:-0}" b="${BN[bloat]:-0}" g=0 st=0 dy=0 ca=0
+    [[ "$(bget load_lost 0)" == 1 ]] && b=999
     if   fl "$l" '<=' 70 && fl "$j" '<=' 8 && fl "$ls" '<=' 0.3 && fl "$b" '<=' 40; then g=2
     elif fl "$l" '<=' 120 && fl "$j" '<=' 15 && fl "$ls" '<=' 1 && fl "$b" '<=' 100; then g=1; fi
     local d4; d4=$(bget dl4_mbps)
-    if   fl "$ls" '<=' 0.5 && { [[ -z "$d4" ]] || fl "$d4" '>=' 50; }; then st=2
-    elif fl "$ls" '<=' 2 && { [[ -z "$d4" ]] || fl "$d4" '>=' 15; }; then st=1; fi
+    if [[ -z "$d4" ]]; then st=-1                                   # streaming / downloads depend on the speed: the quick test never measures it
+    elif fl "$ls" '<=' 0.5 && fl "$d4" '>=' 50; then st=2
+    elif fl "$ls" '<=' 2 && fl "$d4" '>=' 15; then st=1; fi
     if   fl "$ls" '<=' 2 && fl "$l" '<=' 250; then dy=2; elif fl "$ls" '<=' 5; then dy=1; fi
     if   fl "$j" '<=' 15 && fl "$ls" '<=' 1; then ca=2; elif fl "$j" '<=' 30 && fl "$ls" '<=' 3; then ca=1; fi
     bset v_game "$g"; bset v_stream "$st"; bset v_daily "$dy"; bset v_calls "$ca"
@@ -2091,6 +2211,7 @@ bn_mbps() {
     else printf '%s Mbit/s' "$(fmt1 "$1")"; fi
 }
 bn_row() { printf "   ${W}%-12s${NC} %-50s %b\n" "$1" "$2" "$3"; }
+bn_ms() { awk -v v="${1:-0}" 'BEGIN { if (v + 0 >= 10) printf "%.0f", v; else printf "%.1f", v }'; }       # milliseconds: no decimals above 10, one below (0.4 must not read as 0)
 bench_report_summary() {
     local sc grade bar n filled method ip dport
     sc=$(bget score 0); grade=$(bget grade "?"); method=$(bget method); ip=$(bget dest); dport=$(bget dport)
@@ -2102,14 +2223,19 @@ bench_report_summary() {
     echo -e "  ${W}Server${NC}  $(bget host) · $(bget os) · $(bget cpus) vCPU / $(bget ram) MB · $(bget virt) · kernel $(bget kernel)"
     echo -e "  ${W}Path${NC}    $(bget r_dev) ($(bget r_kind), MTU $(bget r_devmtu)) · src $(bget r_src) · cc $(bget cc) · qdisc $(bget qdisc)"
     echo -e "  ${GR}$(hr 76)${NC}"
-    echo -e "  ${W}OVERALL${NC}  ${gc}${bar}${NC}  ${B}${sc}/100${NC}  Grade ${B}${gc}${grade}${NC}$([[ -n "$(bget score_cap)" ]] && echo "  ${GR}limited by $(bget score_cap)${NC}")"
+    if [[ "$(bget nomeasure 0)" == 1 ]]; then
+        echo -e "  ${W}OVERALL${NC}  ${Y}NOT MEASURABLE${NC}  ${GR}nothing answered from this server (see findings)${NC}"
+    else
+        echo -e "  ${W}OVERALL${NC}  ${gc}${bar}${NC}  ${B}${sc}/100${NC}  Grade ${B}${gc}${grade}${NC}$([[ -n "$(bget score_cap)" ]] && echo "  ${GR}limited by $(bget score_cap)${NC}")"
+        echo -e "  ${GR}covers the server → destination leg only$([[ -z "$(bget dl4_mbps)" ]] && echo " · quality only, no speed / load data")${NC}"
+    fi
     echo -e "  ${GR}Use:${NC} Gaming $(verdict_word "$(bget v_game 0)") · Streaming/Download $(verdict_word "$(bget v_stream 0)") · Calls $(verdict_word "$(bget v_calls 0)") · Daily $(verdict_word "$(bget v_daily 0)")"
     echo -e "  ${GR}$(hr 76)${NC}"
     echo -e "  ${C}QUALITY${NC} ${GR}(this server → destination)${NC}"
     if [[ "$(bget icmp_ok 0)" == 1 ]]; then
         bn_row "Latency" "avg $(bget p_avg) ms (min $(bget p_min) / p95 $(bget p_p95) / max $(bget p_max))" "$(rate_dot "$(bget sc_lat 0)")"
         bn_row "Jitter" "$(bget p_jitter) ms avg change between packets" "$(rate_dot "$(bget sc_jit 0)")"
-        bn_row "Packet loss" "$(bget p_loss)% ($(( $(bget p_sent 0) - $(bget p_recv 0) ))/$(bget p_sent 0) lost, longest gap $(bget p_maxburst 0))" "$(rate_dot "$(bget sc_loss 0)")"
+        bn_row "Packet loss" "$(bget p_loss)% ($(( $(bget p_sent 0) - $(bget p_recv 0) ))/$(bget p_sent 0) lost, longest gap $(bget p_maxburst 0))$([[ "$(bget l_sig 0)" != 1 && "$(bget l_cnt 0)" -gt 0 ]] && echo ' - isolated')" "$(rate_dot "$(bget sc_loss 0)")"
         local wn spk=""; wn=$(bget win); local nwin; nwin=$(wc -w <<< "$wn")
         if (( nwin > 1 )); then
             local slo shi
@@ -2125,7 +2251,8 @@ bench_report_summary() {
     else bn_row "TCP connect" "port ${dport} did not accept TCP" "${Y}● n/a${NC}"; fi
     local mt
     if [[ "$(bget m_icmp)" == blocked ]]; then mt="not measured (ICMP filtered)"
-    elif [[ -n "$(bget m_pmtu)" ]]; then mt="path $(bget m_pmtu) / interface $(bget m_iface), TCP MSS $(( $(bget m_pmtu) - 40 ))"
+    elif [[ "$(bget m_unreliable 0)" == 1 ]]; then mt="not reliable (replies lost / rate-limited) - ignored"
+    elif [[ -n "$(bget m_pmtu)" ]]; then mt="path $(bget m_pmtu) / interface $(bget m_iface), TCP MSS $(( $(bget m_pmtu) - $(is_ipv6 "$(bget ip)" && echo 60 || echo 40) ))$([[ "$(bget r_pinned 0)" == 1 ]] && echo ', route pin')"
     else mt="-"; fi
     bn_row "MTU" "$mt" "$( [[ -n "$(bget sc_mtu)" ]] && rate_dot "$(bget sc_mtu)" )"
     if [[ -n "$(bget dl4_mbps)" || -n "$(bget inet_down)" || -n "$(bget lv_down)" ]]; then
@@ -2135,7 +2262,9 @@ bench_report_summary() {
             bn_row "Download" "$(bn_mbps "$(bget dl4_mbps)") (4 streams)  ·  $(bn_mbps "$(bget dl1_mbps)") (1 stream)" "$(rate_dot "$(bget sc_tput 0)")"
             bn_row "Upload" "$(bn_mbps "$(bget ul4_mbps)") (4 streams)  ·  retransmits $(bget ul4_retr 0)" ""
             [[ -n "$(bget udp_loss)" ]] && bn_row "UDP 1 Mbit/s" "loss $(bget udp_loss)%  jitter $(bget udp_jitter) ms (200-byte packets)" ""
-            bn_row "Under load" "+$(fmt0 "$(bget bloat 0)") ms (idle $(fmt0 "$(bget p_avg 0)"), down $(fmt0 "$(bget ldl_avg 0)"), up $(fmt0 "$(bget lul_avg 0)") ms)" "$(rate_dot "$(bget sc_bloat 0)")"
+            if [[ "$(bget load_lost 0)" == 1 ]]; then bn_row "Under load" "no ping got through while the line was busy" "$(rate_dot "$(bget sc_bloat 0)")"
+            elif [[ -n "$(bget bloat)" ]]; then bn_row "Under load" "+$(bn_ms "$(bget bloat 0)") ms (worst ping: idle $(bn_ms "$(bget p_p95 0)"), down $([[ -n "$(bget bl_dl)" ]] && bn_ms "$(bget ldl_p95 0)" || echo -), up $([[ -n "$(bget bl_ul)" ]] && bn_ms "$(bget lul_p95 0)" || echo -) ms)" "$(rate_dot "$(bget sc_bloat 0)")"
+            else bn_row "Under load" "not measured (no ICMP answers)" "${Y}● n/a${NC}"; fi
             [[ -n "$(bget eng_mbps)" ]] && bn_row "Engine" "$(bget method) = $(fmt0 "$(bget eng_ratio 0)")% of direct speed, engine CPU $(bget eng_cpu 0)%, busiest core $(bget engc_max "-")%" ""
         elif [[ -n "$(bget inet_down)" ]]; then
             bn_row "Server→Net" "down $(bget inet_down) / up $(bget inet_up) Mbit/s (Cloudflare, not via tunnel)" ""
@@ -2146,21 +2275,28 @@ bench_report_summary() {
     fi
     echo -e "  ${GR}$(hr 76)${NC}"
     echo -e "  ${C}FINDINGS${NC}"
-    local f sev txt shown=0 mk
-    for f in "${BN_FIND[@]}"; do
-        sev="${f%%|*}"; txt="${f#*|}"; (( shown >= 7 )) && break
-        case "$sev" in crit) mk="${R}✗${NC}" ;; warn) mk="${Y}!${NC}" ;; info) mk="${GR}i${NC}" ;; *) mk="${G}✓${NC}" ;; esac
-        bn_wrap "$mk" "$txt"
-        shown=$((shown + 1))
+    local f sev txt shown=0 mk want
+    for want in crit warn info ok; do          # the page has room for 7 lines: the serious ones must never be the ones cut
+        for f in "${BN_FIND[@]}"; do
+            sev="${f%%|*}"; txt="${f#*|}"; [[ "$sev" == "$want" ]] || continue
+            (( shown >= 7 )) && continue
+            case "$sev" in crit) mk="${R}✗${NC}" ;; warn) mk="${Y}!${NC}" ;; info) mk="${GR}i${NC}" ;; *) mk="${G}✓${NC}" ;; esac
+            bn_wrap "$mk" "$txt"
+            shown=$((shown + 1))
+        done
     done
+    (( ${#BN_FIND[@]} > 7 )) && echo -e "   ${GR}... and $(( ${#BN_FIND[@]} - 7 )) more finding(s) of lower importance on the details page (d)${NC}"
     [[ ${#BN_FIND[@]} -eq 0 ]] && echo -e "   ${G}✓${NC} Nothing to worry about."
     if [[ ${#BN_RECO[@]} -gt 0 ]]; then
         echo -e "  ${GR}$(hr 76)${NC}"
         echo -e "  ${C}NEXT STEPS${NC} ${GR}(Optimization Assistant: PFM → 10)${NC}"
-        local i=0 r id why
+        local i=0 r id why wl wfirst
         for r in "${BN_RECO[@]}"; do
-            i=$((i + 1)); id="${r%%|*}"; why="${r#*|}"
-            printf "   ${W}%d)${NC} %-26s ${GR}%s${NC}\n" "$i" "$(assist_label "$id")" "$why"
+            i=$((i + 1)); id="${r%%|*}"; why="${r#*|}"; wfirst=1
+            while IFS= read -r wl; do           # long reasons are folded under the label so the page stays screenshot-wide
+                if (( wfirst )); then printf "   ${W}%d)${NC} %-26s ${GR}%s${NC}\n" "$i" "$(assist_label "$id")" "$wl"; wfirst=0
+                else printf "%34s${GR}%s${NC}\n" "" "$wl"; fi
+            done < <(fold -s -w 54 <<< "$why" | sed 's/ *$//')
         done
         echo -e "  ${GR}After applying, run this test again - the report shows what changed.${NC}"
     fi
@@ -2168,16 +2304,17 @@ bench_report_summary() {
 bench_report_details() {
     echo -e "  ${B}${C}PFM BENCH TEST - details${NC}  ${GR}:$(bget port) → $(bget dest):$(bget dport)${NC}"
     echo -e "  ${GR}$(hr 76)${NC}"
-    echo -e "  ${C}ROUTE${NC} ${GR}(MTR from this server, 10 probes per hop)${NC}"
+    if [[ "$(bget mtr_tool)" == tracepath ]]; then echo -e "  ${C}ROUTE${NC} ${GR}(tracepath - mtr is not installed: one probe per hop, so no loss figures)${NC}"
+    else echo -e "  ${C}ROUTE${NC} ${GR}(MTR from this server, 10 probes per hop)${NC}"; fi
     if [[ -n "$(bget mtr)" ]]; then
         printf "   ${GR}%-4s %-34s %6s %8s %8s %8s %7s${NC}\n" "hop" "host" "loss%" "avg ms" "best" "worst" "stdev"
-        local h hh lo av be wo sd
+        local h hh lo av be wo sd lc
         while IFS='|' read -r h hh lo _ _ av be wo sd; do
             [[ -n "$h" ]] || continue
-            local lc="$G"; fl "${lo:-0}" '>' 0 && lc="$Y"; fl "${lo:-0}" '>=' 20 && lc="$R"
+            lc="$G"; if [[ "$lo" =~ ^[0-9.]+$ ]]; then fl "$lo" '>' 0 && lc="$Y"; fl "$lo" '>=' 20 && lc="$R"; else lc="$GR"; fi
             printf "   %-4s %-34s ${lc}%6s${NC} %8s %8s %8s %7s\n" "$h" "$hh" "$lo" "$av" "$be" "$wo" "$sd"
         done <<< "$(bget mtr)"
-        echo -e "   ${GR}Loss on middle hops only (not at the last hop) is ICMP rate-limiting.${NC}"
+        [[ "$(bget mtr_tool)" == tracepath ]] || echo -e "   ${GR}Loss on middle hops only (not at the last hop) is ICMP rate-limiting.${NC}"
     else echo -e "   ${GR}no route data${NC}"; fi
     echo -e "  ${GR}$(hr 76)${NC}"
     echo -e "  ${C}RAW NUMBERS${NC}"
@@ -2191,12 +2328,24 @@ bench_report_details() {
         echo -e "   Drops  NIC $(bget nic_drops 0) · backlog $(bget softnet_drops 0) · budget squeeze $(bget softnet_squeeze 0)"
     fi
     echo -e "   Host   load $(bget load) on $(bget cpus) CPU · conntrack $(bget ct_count -)/$(bget ct_max -) (${BN[ct_pct]:-0}%) · TCP rmem max $(( ${BN[rmem_max]:-0} / 1048576 )) MB"
+    if (( ${#BN_FIND[@]} > 7 )); then
+        echo -e "  ${GR}$(hr 76)${NC}"; echo -e "  ${C}ALL FINDINGS${NC}"
+        local f sev txt mk want
+        for want in crit warn info ok; do
+            for f in "${BN_FIND[@]}"; do
+                sev="${f%%|*}"; txt="${f#*|}"; [[ "$sev" == "$want" ]] || continue
+                case "$sev" in crit) mk="${R}✗${NC}" ;; warn) mk="${Y}!${NC}" ;; info) mk="${GR}i${NC}" ;; *) mk="${G}✓${NC}" ;; esac
+                bn_wrap "$mk" "$txt"
+            done
+        done
+    fi
     local prev; prev=$(bench_compare_line)
     if [[ -n "$prev" ]]; then echo -e "  ${GR}$(hr 76)${NC}"; echo -e "  ${C}SINCE THE PREVIOUS TEST${NC}"; echo -e "$prev"; fi
 }
-bn_out() {    # mask mode: the last two numbers of every IPv4 address (and most of an IPv6 one) become x, keeping the column widths
+bn_out() {    # mask mode: the last two numbers of every IPv4 address (and most of an IPv6 one), the destination / server host names and the owner become x, keeping the column widths
     if (( BN_MASK )); then
-        awk '
+        local nm1; nm1=$(bget dest); valid_ip "$nm1" && nm1=""
+        awk -v n1="$nm1" -v n2="$(bget host)" -v n3="$(bget owner)" -v kern="$(bget kernel)" '
             function xs(n,  r) { while (n-- > 0) r = r "x"; return r }
             function mask4(s,  out) {
                 out = ""
@@ -2216,7 +2365,15 @@ bn_out() {    # mask mode: the last two numbers of every IPv4 address (and most 
                 }
                 return out s
             }
-            { print mask6(mask4($0)) }'
+            function lit(s, f,  out, k) {          # every literal occurrence of a name (names shorter than 3 characters would damage ordinary words)
+                if (length(f) < 3) return s
+                out = ""
+                while ((k = index(s, f)) > 0) { out = out substr(s, 1, k - 1) xs(length(f)); s = substr(s, k + length(f)) }
+                return out s
+            }
+            function mask(s) { return mask6(mask4(lit(lit(lit(s, n1), n2), n3))) }
+            { k = (kern != "" ? index($0, kern) : 0)               # a kernel version such as 6.8.0.1042 looks like an address: keep it
+              if (k > 0) print mask(substr($0, 1, k - 1)) kern mask(substr($0, k + length(kern))); else print mask($0) }'
     else cat; fi
 }
 
@@ -2225,8 +2382,9 @@ bench_write_file() {    # plain-text copy of the report (safe to paste anywhere)
     { bench_report_summary; echo; bench_report_details; } 2> /dev/null | sed 's/\x1b\[[0-9;]*m//g' | bn_out > "$1"
 }
 bench_save() {
-    local port; port=$(bget port); local d="$BENCH_DIR/$port" f k
-    mkdir -p "$d"
+    local port d f k um; port=$(bget port); d="$BENCH_DIR/$port"
+    um=$(umask); umask 077                      # reports hold the real addresses: readable by root only
+    mkdir -p "$d"; chmod 700 "$BENCH_DIR" "$d" 2> /dev/null
     [[ -f "$d/last.env" ]] && cp -f "$d/last.env" "$d/prev.env"
     for k in score grade ts mode p_avg p_jitter p_loss dl1_mbps dl4_mbps ul4_mbps bloat eng_ratio m_pmtu t_avg; do printf '%s=%s\n' "$k" "$(bget "$k")"; done > "$d/last.env"
     printf '%s\n' "${BN_RECO[@]}" > "$d/last.reco"
@@ -2234,6 +2392,7 @@ bench_save() {
     bench_write_file "$f"
     ls -1t "$d"/report-*.txt 2> /dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done
     BN_REPORT_FILE="$f"
+    umask "$um"
 }
 envget() { sed -n "s/^$2=//p" "$1" 2> /dev/null | head -1; }
 bench_compare_line() {
@@ -2257,34 +2416,81 @@ bench_compare_line() {
 }
 
 # ── destination-side helper: the other end of the speed test ──
+bench_fw_remove() {    # bench_fw_remove <tag>: every rule of this helper, in every firewall flavour
+    local c
+    for c in iptables ip6tables; do command -v "$c" > /dev/null 2>&1 && ipt_del_tag "$c" filter INPUT "$1"; done
+    command -v nft > /dev/null 2>&1 && nft delete table inet "$1" 2> /dev/null
+    return 0
+}
+bench_fw_sweep() {    # rules of a helper that was killed before it could clean up (SIGKILL, power loss); helpers that are still running are left alone
+    local c t
+    for c in iptables ip6tables; do command -v "$c" > /dev/null 2>&1 || continue
+        for t in $($c -S INPUT 2> /dev/null | sed -n 's/.*--comment \(pfm_bench_[0-9]*\).*/\1/p' | sort -u); do
+            kill -0 "${t#pfm_bench_}" 2> /dev/null && continue
+            ipt_del_tag "$c" filter INPUT "$t"
+        done
+    done
+    command -v nft > /dev/null 2>&1 && for t in $(nft list tables 2> /dev/null | awk '$3 ~ /^pfm_bench_[0-9]+$/ { print $3 }'); do
+        kill -0 "${t#pfm_bench_}" 2> /dev/null && continue
+        nft delete table inet "$t" 2> /dev/null
+    done
+    return 0
+}
+bench_fw_restrict() {    # bench_fw_restrict <port> <allowed ip> <tag> -> 0 only when the restriction is IN the firewall (checked, not assumed)
+    local port="$1" allow="$2" tag="$3" c p main=iptables sel="ip saddr"
+    [[ "$allow" == *:* ]] && { main=ip6tables; sel="ip6 saddr"; }
+    if command -v "$main" > /dev/null 2>&1; then
+        for c in iptables ip6tables; do
+            command -v "$c" > /dev/null 2>&1 || continue
+            for p in tcp udp; do
+                if [[ "$c" == "$main" ]]; then
+                    # final order: [ACCEPT the allowed address] [DROP everybody else] [the rest of the chain] - inserted at the very top, so no broad ACCEPT above can undo it
+                    $c -I INPUT 1 -p "$p" --dport "$port" ! -s "$allow" -m comment --comment "$tag" -j DROP 2> /dev/null || return 1
+                    $c -I INPUT 1 -p "$p" --dport "$port" -s "$allow" -m comment --comment "$tag" -j ACCEPT 2> /dev/null || return 1
+                    $c -C INPUT -p "$p" --dport "$port" ! -s "$allow" -m comment --comment "$tag" -j DROP 2> /dev/null || return 1
+                    $c -C INPUT -p "$p" --dport "$port" -s "$allow" -m comment --comment "$tag" -j ACCEPT 2> /dev/null || return 1
+                else
+                    $c -I INPUT 1 -p "$p" --dport "$port" -m comment --comment "$tag" -j DROP 2> /dev/null     # the other family: nobody (the helper does not even listen there)
+                fi
+            done
+        done
+        return 0
+    fi
+    command -v nft > /dev/null 2>&1 || return 1          # a host with nftables only
+    nft add table inet "$tag" 2> /dev/null \
+        && nft add chain inet "$tag" input '{ type filter hook input priority -100 ; policy accept ; }' 2> /dev/null \
+        && nft add rule inet "$tag" input meta l4proto '{ tcp, udp }' th dport "$port" $sel != "$allow" drop 2> /dev/null \
+        && nft list table inet "$tag" 2> /dev/null | grep -q drop && return 0
+    nft delete table inet "$tag" 2> /dev/null; return 1
+}
+bench_port_busy() { ss -ltun "( sport = :$1 )" 2> /dev/null | tail -n +2 | grep -q .; }       # a TCP or UDP service already listens there
 cmd_bench_server() {
-    local port="${1:-5201}" allow="${2:-}" mins="${3:-15}" tag="pfm_bench_$$" c
-    [[ "$port" =~ ^[0-9]+$ ]] || { echo "usage: pfm bench-server [port] [allowed client IP] [minutes]"; return 1; }
+    local port="${1:-5201}" allow="${2:-}" mins="${3:-15}" tag="pfm_bench_$$" ipf="" srv="" wd="" use="usage: pfm bench-server [port] [allowed client IP] [minutes 1-120]"
+    valid_port "$port" || { echo -e "${R}'$port' is not a valid port.${NC}  $use"; return 1; }
+    [[ "$mins" =~ ^[0-9]+$ ]] && (( mins >= 1 && mins <= 120 )) || { echo -e "${R}'$mins' minutes is not between 1 and 120.${NC}  $use"; return 1; }
+    [[ -z "$allow" ]] || valid_ip "$allow" || { echo -e "${R}'$allow' is not an IP address.${NC}  $use"; return 1; }
     [[ $EUID -eq 0 ]] || { echo -e "${R}Run as root (it installs iperf3 and opens the port for ${allow:-anyone}).${NC}"; return 1; }
     ensure_tool iperf3 "speed-test helper" || return 1
+    # the helper opens TCP AND UDP on the port: refuse one that something else uses (WireGuard / QUIC on a UDP port would lose its peers)
+    if bench_port_busy "$port"; then echo -e "${R}Port ${port} is already used by another service (TCP or UDP).${NC} Choose a free port, e.g. pfm bench-server 5201"; return 1; fi
+    bench_fw_sweep
+    [[ -n "$allow" ]] && { ipf="-4"; [[ "$allow" == *:* ]] && ipf="-6"; }
     echo -e "\n  ${B}${C}PFM bench helper${NC}  iperf3 on port ${port} for ${mins} min"
-    if [[ -n "$allow" ]]; then echo -e "  ${GR}Only ${allow} may connect (temporary firewall rules, removed when this stops).${NC}"
-    else echo -e "  ${Y}No client IP given: anyone who can reach port ${port} can use your bandwidth until this stops.${NC}"; fi
-    if [[ -n "$allow" ]]; then
-        for c in iptables ip6tables; do command -v "$c" > /dev/null 2>&1 || continue
-            [[ "$c" == iptables && "$allow" == *:* ]] && continue; [[ "$c" == ip6tables && "$allow" != *:* ]] && continue
-            $c -I INPUT -p tcp --dport "$port" -s "$allow" -m comment --comment "$tag" -j ACCEPT 2> /dev/null
-            $c -I INPUT -p udp --dport "$port" -s "$allow" -m comment --comment "$tag" -j ACCEPT 2> /dev/null
-            $c -A INPUT -p tcp --dport "$port" -m comment --comment "$tag" -j DROP 2> /dev/null
-            $c -A INPUT -p udp --dport "$port" -m comment --comment "$tag" -j DROP 2> /dev/null
-        done
-        command -v ufw > /dev/null 2>&1 && ufw status 2> /dev/null | grep -q 'Status: active' && { ufw allow from "$allow" to any port "$port" > /dev/null 2>&1; }
-    fi
-    bench_server_cleanup() {
-        for c in iptables ip6tables; do command -v "$c" > /dev/null 2>&1 || continue
-            ipt_del_tag "$c" filter INPUT "$tag"
-        done
-        [[ -n "$allow" ]] && command -v ufw > /dev/null 2>&1 && ufw delete allow from "$allow" to any port "$port" > /dev/null 2>&1
-    }
-    local srv
+    # the clean-up exists BEFORE the first firewall rule does
+    bench_server_cleanup() { [[ -n "$wd" ]] && { pkill -P "$wd" 2> /dev/null; kill "$wd" 2> /dev/null; }; bench_fw_remove "$tag"; }
     trap 'kill "$srv" 2> /dev/null; bench_server_cleanup; echo -e "\n  ${GR}Helper stopped.${NC}"; exit 0' INT TERM HUP
+    if [[ -n "$allow" ]]; then
+        if ! bench_fw_restrict "$port" "$allow" "$tag"; then
+            bench_server_cleanup; trap - INT TERM HUP
+            echo -e "  ${R}Could not restrict port ${port} to ${allow} (no usable iptables / nftables rule), so the helper is NOT started - it would be open to everybody.${NC}"
+            echo -e "  ${GR}If you accept that anyone who can reach the port may use your bandwidth for ${mins} minutes: pfm bench-server ${port}${NC}"
+            return 1
+        fi
+        echo -e "  ${G}Only ${allow} may connect${NC} ${GR}(verified in the firewall; the rules are removed when this stops)${NC}"
+        ( trap '' HUP INT; sleep $(( mins * 60 + 30 )); bench_fw_remove "$tag" ) > /dev/null 2>&1 & wd=$!       # outlives a kill -9 of this process
+    else echo -e "  ${Y}No client IP given: anyone who can reach port ${port} can use your bandwidth until this stops.${NC}"; fi
     echo -e "  ${G}Ready.${NC} On the PFM server choose the full test and enter port ${port}. Ctrl+C stops it.\n"
-    timeout "${mins}m" iperf3 -s -p "$port" & srv=$!       # in the background + wait: a signal must run the cleanup at once
+    timeout "${mins}m" iperf3 -s $ipf -p "$port" & srv=$!       # in the background + wait: a signal must run the cleanup at once
     wait "$srv"
     bench_server_cleanup; trap - INT TERM HUP
     echo -e "\n  ${GR}Helper stopped.${NC}"
@@ -2315,14 +2521,15 @@ bench_show() {    # interactive viewer for the report of the test that just ran
             r) return 2 ;;
             ""|0|q) return 0 ;;
             *) if [[ "$act" =~ ^[0-9]+$ ]] && (( act >= 1 && act <= ${#BN_RECO[@]} )); then
-                   assist_do "${BN_RECO[act-1]%%|*}" "$(bget port)"
-                   echo -e "\n  ${G}Done.${NC} Press ${W}r${NC} to run the test again and see what changed."; pause
+                   if assist_do "${BN_RECO[act-1]%%|*}" "$(bget port)"; then echo -e "\n  ${G}Done.${NC} Press ${W}r${NC} to run the test again and see what changed."
+                   else echo -e "\n  ${Y}Nothing was changed${NC} ${GR}(see the message above).${NC}"; fi
+                   pause
                fi ;;
         esac
     done
 }
 menu_bench() {
-    local port="$1" pp="" mode ret
+    local port="$1" pp="" mode ret inet=0 a
     [[ -f "$PORTS_DIR/$port" ]] || return
     while true; do
         header
@@ -2336,14 +2543,18 @@ menu_bench() {
         echo -ne "\n  ${C}Select:${NC} "; read -r opt || return 0
         case "$opt" in
             1|2)
-                mode=quick; pp=0
+                mode=quick; pp=0; inet=0
                 if [[ "$opt" == 2 ]]; then
                     mode=full
-                    echo -ne "\n  ${C}Speed-test helper port on the destination [5201], or ${W}s${C} to skip the speed test:${NC} "; read -r pp
-                    [[ "$pp" == s || "$pp" == S ]] && pp=0 || { pp="${pp:-5201}"; [[ "$pp" =~ ^[0-9]+$ ]] || pp=0; }
+                    echo -ne "\n  ${C}Speed-test helper port on the destination [5201], or ${W}s${C} to skip the speed test:${NC} "; read -r pp || return 0
+                    if [[ "$pp" == s || "$pp" == S ]]; then
+                        pp=0
+                        echo -ne "  ${C}Instead measure this server's own internet speed (downloads up to 100 MB from Cloudflare)? (y/N):${NC} "; read -r a
+                        [[ "$a" == y || "$a" == Y ]] && inet=1
+                    else pp="${pp:-5201}"; [[ "$pp" =~ ^[0-9]+$ ]] && valid_port "$pp" || pp=0; fi
                     if (( pp > 0 )); then
                         bench_prepare "$port" > /dev/null
-                        ensure_tool iperf3 "speed test" > /dev/null || pp=0
+                        ensure_tool iperf3 "speed test" || pp=0
                         if (( pp > 0 )) && ! iperf_peer_ok "$(bget ip)" "$pp"; then
                             bench_peer_help "$pp"
                             echo -ne "\n  ${C}Enter when it is running, ${W}s${C} to skip the speed test:${NC} "; read -r a
@@ -2351,12 +2562,12 @@ menu_bench() {
                         fi
                     fi
                 fi
-                ensure_tool ping "latency test" > /dev/null || { echo -e "  ${R}ping is required.${NC}"; pause; continue; }
-                bench_run "$port" "$mode" "$pp" || { pause; continue; }
+                ensure_tool ping "latency test" || { echo -e "  ${R}ping is required.${NC}"; pause; continue; }
+                bench_run "$port" "$mode" "$pp" "$inet" || { pause; continue; }
                 bench_save
                 bench_show; ret=$?
                 while [[ $ret == 2 ]]; do                       # r / applied an action: run again
-                    bench_run "$port" "$mode" "$pp" || break
+                    bench_run "$port" "$mode" "$pp" "$inet" || break
                     bench_save; bench_show; ret=$?
                 done ;;
             3)
@@ -2368,18 +2579,24 @@ menu_bench() {
         esac
     done
 }
-cmd_bench() {    # pfm bench <port> [quick|full] [--peer PORT] [--yes] [--mask]
+cmd_bench() {    # pfm bench <port> [quick|full] [--peer PORT] [--inet] [--yes] [--mask]
     check_root
-    local port="${1:-}" mode=quick pp=0; shift 2> /dev/null
-    [[ -f "$PORTS_DIR/$port" ]] || { echo "usage: pfm bench <port> [quick|full] [--peer PORT] [--yes] [--mask]"; return 1; }
+    local port="${1:-}" mode=quick pp=0 inet=0 use="usage: pfm bench <port> [quick|full] [--peer PORT] [--inet] [--yes] [--mask]"; shift 2> /dev/null
+    [[ -f "$PORTS_DIR/$port" ]] || { echo "$use"; return 1; }
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            quick|full) mode="$1" ;; --peer) pp="${2:-5201}"; shift ;; --yes|-y) PFM_YES=1 ;; --mask) BN_MASK=1 ;;
-            *) echo "unknown option '$1'"; echo "usage: pfm bench <port> [quick|full] [--peer PORT] [--yes] [--mask]"; return 1 ;;
+            quick|full) mode="$1" ;; --peer) pp="${2:-5201}"; shift ;; --inet) inet=1 ;; --yes|-y) PFM_YES=1 ;; --mask) BN_MASK=1 ;;
+            *) echo "unknown option '$1'"; echo "$use"; return 1 ;;
         esac; shift
     done
-    ensure_tool ping "latency test" > /dev/null || { echo "ping is required"; return 1; }
-    bench_run "$port" "$mode" "$pp" || return 1
+    [[ "$pp" =~ ^[0-9]+$ ]] && { (( pp == 0 )) || valid_port "$pp"; } || { echo "--peer needs a port number (1-65535)"; echo "$use"; return 1; }
+    ensure_tool ping "latency test" || { echo "ping is required"; return 1; }
+    if (( pp > 0 )); then     # the same checks the menu makes: a missing helper must say so instead of turning a "full" report into a quick one
+        bench_prepare "$port" > /dev/null || { echo -e "  ${R}Cannot start the test: tunnel not found, destination does not resolve, or no route to it.${NC}"; return 1; }
+        if ! ensure_tool iperf3 "speed test"; then echo -e "  ${Y}Without iperf3 there is no speed test - continuing without it.${NC}"; pp=0
+        elif ! iperf_peer_ok "$(bget ip)" "$pp"; then bench_peer_help "$pp"; echo -e "\n  ${Y}Helper not reachable - continuing without the speed test.${NC}"; pp=0; fi
+    fi
+    bench_run "$port" "$mode" "$pp" "$inet" || return 1
     bench_save
     echo; { bench_report_summary; echo; bench_report_details; } | bn_out
     echo -e "\n  ${GR}Saved: ${BN_REPORT_FILE}${NC}"
@@ -2394,25 +2611,36 @@ SYSCTL_D_FILE="${PFM_SYSCTL_D_FILE:-/etc/sysctl.d/99-pfm.tune.conf}"
 MODLOAD_FILE="${PFM_MODLOAD_FILE:-/etc/modules-load.d/bbr.conf}"
 PFM_ROUTE_PROTO=77         # routes the assistant creates carry this protocol number, so only they are ever removed
 
-tune_init() { mkdir -p "$TUNE_DIR"; local f; for f in history.log sysctl.orig sysctl.conf nic.conf nic.orig; do [[ -e "$TUNE_DIR/$f" ]] || : > "$TUNE_DIR/$f"; done; }
+tune_init() { mkdir -p "$TUNE_DIR"; local f; for f in history.log sysctl.orig sysctl.conf nic.conf nic.orig mss.ports; do [[ -e "$TUNE_DIR/$f" ]] || : > "$TUNE_DIR/$f"; done; }
 tune_hist() { tune_init; echo "$(date +%s)|$1|$2" >> "$TUNE_DIR/history.log"; log "TUNE $1: $2"; }
 kv_get() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2> /dev/null; }
 kv_has() { awk -F= -v k="$2" '$1 == k { f = 1 } END { exit !f }' "$1" 2> /dev/null; }
-kv_set() { local f="$1" k="$2" v="$3" t; t=$(mktemp); touch "$f"; awk -F= -v k="$k" '$1 != k' "$f" > "$t"; echo "$k=$v" >> "$t"; cat "$t" > "$f"; rm -f "$t"; }
-kv_del() { local f="$1" t; t=$(mktemp); awk -F= -v k="$2" '$1 != k' "$f" > "$t" 2> /dev/null; cat "$t" > "$f"; rm -f "$t"; }
+kv_set() {    # replaced as a whole: a kill or a full disk must never leave a half-written (empty) record of the original values
+    local f="$1" k="$2" v="$3" t; touch "$f" 2> /dev/null; t=$(mktemp "$f.XXXXXX") || return 1
+    { awk -F= -v k="$k" '$1 != k' "$f"; echo "$k=$v"; } > "$t" && mv -f "$t" "$f" || { rm -f "$t"; return 1; }
+}
+kv_del() { local f="$1" t; [[ -f "$f" ]] || return 0; t=$(mktemp "$f.XXXXXX") || return 1; awk -F= -v k="$2" '$1 != k' "$f" > "$t" && mv -f "$t" "$f" || { rm -f "$t"; return 1; }; }
 port_set() { local f="$PORTS_DIR/$1" k="$2" v="$3"; [[ -f "$f" ]] || return 1; if grep -q "^$k=" "$f"; then sed -i "s|^$k=.*|$k=\"$v\"|" "$f"; else echo "$k=\"$v\"" >> "$f"; fi; }
 port_unset() { sed -i "/^$2=/d" "$PORTS_DIR/$1" 2> /dev/null; }
 
 # ── kernel tunables: original value remembered, change persisted, re-applied at boot and by sync ──
+TUNE_OK=0; TUNE_NO=0       # settings really written / refused since tune_count_reset: the closing line must tell the truth
+tune_count_reset() { TUNE_OK=0; TUNE_NO=0; }
 tune_sysctl() {    # tune_sysctl <key> <value> -> 0 applied · 1 not in this kernel · 2 refused (container / read-only)
     local k="$1" v="$2" cur
     sys_has "$k" || return 1
     tune_init; cur=$(sys_get "$k")
     kv_has "$TUNE_DIR/sysctl.orig" "$k" || kv_set "$TUNE_DIR/sysctl.orig" "$k" "$cur"
-    if [[ "$cur" != "$v" ]]; then sys_set "$k" "$v" || return 2; fi
+    if [[ "$cur" != "$v" ]]; then sys_set "$k" "$v" || { TUNE_NO=$((TUNE_NO + 1)); return 2; }; fi
     kv_set "$TUNE_DIR/sysctl.conf" "$k" "$v"
     tune_sysctl_d
+    TUNE_OK=$((TUNE_OK + 1))
     return 0
+}
+tune_done() {    # the closing line of an action: "Done" only when something was really changed
+    if (( TUNE_NO > 0 && TUNE_OK == 0 )); then echo -e "  ${R}Nothing was changed: this system refuses the settings (container or read-only /proc/sys).${NC}"; return 1
+    elif (( TUNE_NO > 0 )); then echo -e "  ${Y}Done - but ${TUNE_NO} setting(s) were refused by this system.${NC}"
+    else echo -e "  ${G}Done.${NC}"; fi
 }
 tune_raise() {    # only ever raises a numeric tunable
     local k="$1" v="$2" cur; cur=$(sys_get "$k")
@@ -2420,9 +2648,18 @@ tune_raise() {    # only ever raises a numeric tunable
     (( cur >= v )) && return 0
     tune_sysctl "$k" "$v"
 }
+tune_raise_tcpmem() {    # tune_raise_tcpmem <net.ipv4.tcp_rmem|tcp_wmem> <max>: only the third field (the auto-tuning ceiling) is raised; min and default stay
+    local k="$1" want="$2" a b c
+    read -r a b c <<< "$(sys_get "$k")"
+    [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] || return 1
+    (( c >= want )) && return 0
+    tune_sysctl "$k" "$a $b $want"
+}
 tune_sysctl_d() {    # the same settings for the kernel's own boot-time loader (applied after /etc/sysctl.d/99-pfm.conf)
+    local t
     if [[ -s "$TUNE_DIR/sysctl.conf" ]]; then
-        { echo "# Written by the PFM Optimization Assistant. 'pfm optimize' -> Status & revert removes it."; sed 's/=/ = /' "$TUNE_DIR/sysctl.conf"; } > "$SYSCTL_D_FILE"
+        t=$(mktemp "$SYSCTL_D_FILE.XXXXXX") || return 0
+        { echo "# Written by the PFM Optimization Assistant. 'pfm optimize' -> Status & revert removes it."; sed 's/=/ = /' "$TUNE_DIR/sysctl.conf"; } > "$t" && chmod 644 "$t" && mv -f "$t" "$SYSCTL_D_FILE" || rm -f "$t"
     else rm -f "$SYSCTL_D_FILE"; fi
 }
 tune_sysctl_restore() { local k v; [[ -s "$TUNE_DIR/sysctl.conf" ]] || return 0; while IFS='=' read -r k v; do [[ -n "$k" ]] && sys_set "$k" "$v" 2> /dev/null; done < "$TUNE_DIR/sysctl.conf"; return 0; }
@@ -2443,6 +2680,12 @@ sysctl_row() {    # sysctl_row <label> <key> <wanted> [raise]  - one line of a p
     else [[ "$cur" == "$want" ]] && return 0; fi
     printf "   %-26s %-22s -> %s\n" "$label" "${cur:0:22}" "$want"
 }
+sysctl_row_tcpmem() {    # sysctl_row_tcpmem <label> <key> <wanted max> - the third field of tcp_rmem / tcp_wmem
+    local c; sys_has "$2" || return 0
+    c=$(sys_get "$2" | awk '{ print $3 }')
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= $3 )) && return 0
+    printf "   %-26s %-22s -> %s\n" "$1" "${c:-?}" "$3"
+}
 
 # ── congestion control ──
 bbr_available() {
@@ -2451,21 +2694,23 @@ bbr_available() {
     [[ "$a" == *bbr* ]]
 }
 assist_bbr() {
-    local cc qd; cc=$(sys_get net.ipv4.tcp_congestion_control); qd=$(sys_get net.core.default_qdisc)
+    local cc qd dev swap=""; cc=$(sys_get net.ipv4.tcp_congestion_control); qd=$(sys_get net.core.default_qdisc); dev=$(nic_default_dev)
+    [[ -n "$dev" && -n "$(nic_qdisc_targets "$dev")" ]] && swap="$dev"
     echo -e "\n  ${B}${W}BBR + fq${NC}\n"
     echo -e "  ${GR}Now: congestion control ${cc:-?}, default qdisc ${qd:-n/a}${NC}"
     echo -e "  ${GR}BBR keeps TCP fast on long or lossy paths and keeps queues short. It acts on connections this server${NC}"
     echo -e "  ${GR}terminates itself (realm / HAProxy tunnels); iptables-forwarded connections are only NAT-ed.${NC}\n"
     if ! bbr_available; then echo -e "  ${R}BBR is not available here (kernel older than 4.9, or a container without the module).${NC}"; return 1; fi
-    if [[ "$cc" == bbr && "$qd" == fq ]]; then echo -e "  ${G}Already active.${NC}"; return 0; fi
+    if [[ "$cc" == bbr && "$qd" == fq && -z "$swap" ]]; then echo -e "  ${G}Already active.${NC}"; return 0; fi
+    [[ -n "$swap" ]] && echo -e "  ${GR}Also: the queue of $swap is the kernel default ($(nic_root_qdisc "$swap")) - it is switched to fq right away (a custom qdisc is never touched).${NC}\n"
     confirm "Enable BBR + fq now and keep it after reboot?" y || return 1
-    local r
+    local r; tune_count_reset
     tune_sysctl net.core.default_qdisc fq; r=$?
     case $r in 1) echo -e "  ${Y}fq is not available in this kernel - BBR still works (it paces itself).${NC}" ;; 2) echo -e "  ${Y}default qdisc cannot be changed here.${NC}" ;; esac
     tune_sysctl net.ipv4.tcp_congestion_control bbr; r=$?
     if (( r != 0 )); then echo -e "  ${R}Could not switch the congestion control (${r}).${NC}"; return 1; fi
     grep -q tcp_bbr "$MODLOAD_FILE" 2> /dev/null || { mkdir -p "$(dirname "$MODLOAD_FILE")"; echo tcp_bbr > "$MODLOAD_FILE"; }
-    local dev; dev=$(nic_default_dev); [[ -n "$dev" ]] && nic_set_qdisc "$dev"
+    [[ -n "$dev" ]] && nic_set_qdisc "$dev"
     tune_hist cc "BBR + fq enabled (was ${cc:-?}/${qd:-?})"
     echo -e "  ${G}BBR is active${NC} ${GR}($(sys_get net.ipv4.tcp_congestion_control), qdisc $(sys_get net.core.default_qdisc)). New connections use it; existing ones keep their old algorithm.${NC}"
 }
@@ -2479,13 +2724,14 @@ assist_buffers() {    # assist_buffers [rtt_ms] [target Mbit/s]
     cur=$(sys_get net.ipv4.tcp_rmem | awk '{ print $3 }')
     echo -e "\n  ${B}${W}TCP buffers${NC}\n"
     echo -e "  ${GR}A single connection can only use (window / latency): to fill ${rate} Mbit/s at ${rtt} ms it needs a window of about $(human_bytes $(( need / 2 ))).${NC}"
-    echo -e "  ${GR}Now: TCP receive-buffer limit $(( ${cur:-0} / 1048576 )) MB   ->   proposed $(( pick / 1048576 )) MB (limit only; memory is used when a connection needs it).${NC}\n"
+    echo -e "  ${GR}Now: TCP receive-buffer limit $(( ${cur:-0} / 1048576 )) MB   ->   proposed $(( pick / 1048576 )) MB (limits only - memory is used when a connection needs it; values are only ever raised).${NC}\n"
     if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur >= pick )); then echo -e "  ${G}Already large enough.${NC}"; return 0; fi
     confirm "Raise the limits to $(( pick / 1048576 )) MB?" y || return 1
-    tune_sysctl net.core.rmem_max "$pick"; tune_sysctl net.core.wmem_max "$pick"
-    tune_sysctl net.ipv4.tcp_rmem "4096 131072 $pick"; tune_sysctl net.ipv4.tcp_wmem "4096 65536 $pick"
-    tune_hist buffers "TCP buffer limit $(( ${cur:-0} / 1048576 )) MB -> $(( pick / 1048576 )) MB (${rtt} ms x ${rate} Mbit/s)"
-    echo -e "  ${G}Done.${NC}"
+    tune_count_reset
+    tune_raise net.core.rmem_max "$pick"; tune_raise net.core.wmem_max "$pick"
+    tune_raise_tcpmem net.ipv4.tcp_rmem "$pick"; tune_raise_tcpmem net.ipv4.tcp_wmem "$pick"
+    (( TUNE_OK > 0 )) && tune_hist buffers "TCP buffer limit $(( ${cur:-0} / 1048576 )) MB -> $(( pick / 1048576 )) MB (${rtt} ms x ${rate} Mbit/s)"
+    tune_done
 }
 
 # ── limits that silently cap busy forwarders ──
@@ -2506,9 +2752,12 @@ limits_apply() {
     tune_raise net.netfilter.nf_conntrack_max "$ct"
     tune_raise net.core.somaxconn 8192; tune_raise net.ipv4.tcp_max_syn_backlog 8192
     tune_raise net.core.netdev_max_backlog 16384; tune_raise fs.file-max 1048576
-    # a hash table sized for the larger limit keeps lookups fast
-    local hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}" want
-    if [[ -w "$hs" ]]; then want=$(( $(sys_get net.netfilter.nf_conntrack_max) / 4 )); [[ "$(cat "$hs")" -lt "$want" ]] && echo "$want" > "$hs" 2> /dev/null; fi
+    # a hash table sized for the larger limit keeps lookups fast (only when both values can be read)
+    local hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}" want cmax hcur
+    if [[ -w "$hs" ]]; then
+        cmax=$(sys_get net.netfilter.nf_conntrack_max); hcur=$(cat "$hs" 2> /dev/null)
+        if [[ "$cmax" =~ ^[0-9]+$ && "$hcur" =~ ^[0-9]+$ ]]; then want=$(( cmax / 4 )); (( hcur < want )) && echo "$want" > "$hs" 2> /dev/null; fi
+    fi
     return 0
 }
 assist_limits() {
@@ -2518,7 +2767,9 @@ assist_limits() {
     echo -e "  ${GR}A busy forwarder hits these before it hits the bandwidth: new connections are dropped when they are full.${NC}\n"
     printf "   ${GR}%-26s %-22s    %s${NC}\n" "setting" "now" "proposed"; echo "$plan"; echo ""
     confirm "Apply (values are only ever raised)?" y || return 1
-    limits_apply; tune_hist limits "connection / queue limits raised"; echo -e "  ${G}Done.${NC}"
+    tune_count_reset; limits_apply
+    (( TUNE_OK > 0 )) && tune_hist limits "connection / queue limits raised"
+    tune_done
 }
 
 # ── network card ──
@@ -2536,20 +2787,39 @@ cpu_mask_hex() {    # n CPUs -> kernel cpumask: 32-bit hex groups, most signific
 }
 nic_feature() { ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f { sub(/ .*/, "", $2); print $2; exit }'; }
 nic_feature_fixed() { ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f && /\[fixed\]/ { r = 1 } END { exit !r }'; }
-nic_set_qdisc() {    # make the root qdisc fq (BBR's partner); multi-queue cards get it on every queue
-    local dev="$1" root q
-    command -v tc > /dev/null 2>&1 || return 1
-    root=$(tc qdisc show dev "$dev" root 2> /dev/null | awk 'NR == 1 { print $2 }')
+nic_root_qdisc() { tc qdisc show dev "$1" root 2> /dev/null | awk 'NR == 1 { print $2 }'; }
+nic_qdisc_targets() {    # the queues of <dev> that are the kernel's plain default and would become fq, one "<target> <kind>" per line: "root pfifo_fast" / ":3 pfifo_fast".
+    local dev="$1" all root              # Anything somebody configured (fq_codel, cake, htb, netem, tbf ...) and virtual noqueue devices are left alone.
+    command -v tc > /dev/null 2>&1 || return 0
+    all=$(tc qdisc show dev "$dev" 2> /dev/null) || return 0
+    root=$(awk '/ root( |$)/ { print $2; exit }' <<< "$all")
     case "$root" in
-        fq|fq_codel|cake) return 0 ;;
-        mq)  for q in $(tc qdisc show dev "$dev" 2> /dev/null | awk '/parent :/ && $2 != "fq" && $2 != "fq_codel" && $2 != "cake" { print $5 }'); do
-                 tc qdisc replace dev "$dev" parent "$q" fq 2> /dev/null || return 1
-             done ;;
-        *)   tc qdisc replace dev "$dev" root fq 2> /dev/null || return 1 ;;
+        pfifo_fast|pfifo) echo "root $root" ;;
+        mq) awk '$2 ~ /^(pfifo_fast|pfifo)$/ { for (i = 1; i < NF; i++) if ($i == "parent") print $(i + 1), $2 }' <<< "$all" ;;
     esac
-    kv_set "$TUNE_DIR/nic.orig" "qdisc:$dev" "${root:-noqueue}"; kv_set "$TUNE_DIR/nic.conf" "qdisc:$dev" fq
+}
+nic_qdisc_wanted() { [[ "$(sys_get net.ipv4.tcp_congestion_control)" == bbr ]]; }
+nic_set_qdisc() {    # make the kernel-default queue of <dev> fq (BBR's partner); multi-queue cards get it on every queue
+    local dev="$1" targets t k first
+    command -v tc > /dev/null 2>&1 || return 1
+    targets=$(nic_qdisc_targets "$dev"); [[ -n "$targets" ]] || return 0
+    tune_init
+    first=$(awk 'NR == 1 { print $2 }' <<< "$targets")
+    kv_has "$TUNE_DIR/nic.orig" "qdisc:$dev" || kv_set "$TUNE_DIR/nic.orig" "qdisc:$dev" "$([[ "$(nic_root_qdisc "$dev")" == mq ]] && echo mq || echo root) $first"      # the first original wins, even when somebody changes the queue later
+    while read -r t k; do
+        [[ -n "$t" ]] || continue
+        if [[ "$t" == root ]]; then tc qdisc replace dev "$dev" root fq 2> /dev/null || return 1
+        else tc qdisc replace dev "$dev" parent "$t" fq 2> /dev/null || return 1; fi
+    done <<< "$targets"
+    kv_set "$TUNE_DIR/nic.conf" "qdisc:$dev" fq
     return 0
 }
+
+nic_ring() {    # nic_ring <dev> -> "<max rx> <max tx> <current rx> <current tx>" (zeros when the driver has no ring settings)
+    ethtool -g "$1" 2> /dev/null | awk '/^Pre-set maximums/ { s = 1 } /^Current hardware/ { s = 2 } /^RX:/ { if (s == 1) rm = $2; if (s == 2) rc = $2 } /^TX:/ { if (s == 1) tm = $2; if (s == 2) tc = $2 } END { print rm + 0, tm + 0, rc + 0, tc + 0 }'
+}
+nic_norm_mask() { local m="${1//,/}"; m="${m,,}"; m="${m#"${m%%[!0]*}"}"; echo "${m:-0}"; }      # the kernel pads a cpumask with zeros, we store it without
+nic_wanted_features() { printf '%s\n' "generic-receive-offload gro on" "generic-segmentation-offload gso on" "tcp-segmentation-offload tso on" "large-receive-offload lro off"; }
 nic_scan() {    # nic_scan <dev> -> one-line facts
     local dev="$1" drv speed rxq cpus drops
     drv=$(ethtool -i "$dev" 2> /dev/null | awk '/^driver:/ { print $2 }')
@@ -2558,85 +2828,98 @@ nic_scan() {    # nic_scan <dev> -> one-line facts
     drops=$(( $(cat "$SYSFS_NET/$dev/statistics/rx_dropped" 2> /dev/null || echo 0) + $(cat "$SYSFS_NET/$dev/statistics/rx_missed_errors" 2> /dev/null || echo 0) ))
     echo "dev=$dev driver=${drv:-?} speed=$speed rxq=$rxq cpus=$cpus drops=$drops mtu=$(cat "$SYSFS_NET/$dev/mtu" 2> /dev/null) gro=$(nic_feature "$dev" generic-receive-offload) gso=$(nic_feature "$dev" generic-segmentation-offload) tso=$(nic_feature "$dev" tcp-segmentation-offload) lro=$(nic_feature "$dev" large-receive-offload)"
 }
-nic_plan() {    # nic_plan <dev> -> rows describing what would change
-    local dev="$1" f cpus rxq feat st
+nic_plan() {    # nic_plan <dev> [fq] -> rows describing what would change ("fq" = BBR is about to be enabled, so the queue is part of the plan too)
+    local dev="$1" want_fq="${2:-}" cpus rxq spec feat f st cur
     cpus=$(nproc 2> /dev/null || echo 1); rxq=$(nic_rxq "$dev")
-    if (( rxq == 1 && cpus > 1 )) && [[ -w "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" || -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]]; then
-        [[ "$(tr -d ',0' < "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)" == "" ]] && printf "   %-30s %-14s -> %s\n" "$dev: spread RX over CPUs (RPS)" "1 CPU handles all" "$cpus CPUs"
+    if (( rxq == 1 && cpus > 1 )) && [[ -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]]; then
+        [[ "$(nic_norm_mask "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)")" == 0 ]] && printf "   %-30s %-14s -> %s\n" "$dev: spread RX over CPUs (RPS)" "1 CPU handles all" "$cpus CPUs"
+    fi
+    if [[ -n "$want_fq" ]] || nic_qdisc_wanted; then
+        [[ -n "$(nic_qdisc_targets "$dev")" ]] && printf "   %-30s %-14s -> %s\n" "$dev: queue (live, no reboot)" "$(nic_root_qdisc "$dev")" "fq"
     fi
     command -v ethtool > /dev/null 2>&1 || return 0
-    for f in "generic-receive-offload:on" "generic-segmentation-offload:on" "tcp-segmentation-offload:on" "large-receive-offload:off"; do
-        feat="${f%%:*}"; st="${f##*:}"
+    while read -r feat f st; do
         nic_feature_fixed "$dev" "$feat" && continue
-        [[ -n "$(nic_feature "$dev" "$feat")" && "$(nic_feature "$dev" "$feat")" != "$st" ]] && printf "   %-30s %-14s -> %s\n" "$dev: $feat" "$(nic_feature "$dev" "$feat")" "$st"
-    done
+        cur=$(nic_feature "$dev" "$feat")
+        [[ -n "$cur" && "$cur" != "$st" ]] && printf "   %-30s %-14s -> %s\n" "$dev: $feat" "$cur" "$st"
+    done < <(nic_wanted_features)
     return 0
 }
 nic_apply() {    # nic_apply <dev> [rings]
-    local dev="$1" rings="${2:-0}" cpus rxq q mask nq f feat st
+    local dev="$1" rings="${2:-0}" cpus rxq q mask feat f st cur okq=0 sq
     cpus=$(nproc 2> /dev/null || echo 1); rxq=$(nic_rxq "$dev"); tune_init
     if (( rxq == 1 && cpus > 1 )) && [[ -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]]; then
-        mask=$(cpu_mask_hex "$cpus"); nq=$rxq
+        mask=$(cpu_mask_hex "$cpus")
         for q in "$SYSFS_NET/$dev"/queues/rx-*; do
-            kv_has "$TUNE_DIR/nic.orig" "rps:$dev:$(basename "$q")" || kv_set "$TUNE_DIR/nic.orig" "rps:$dev:$(basename "$q")" "$(cat "$q/rps_cpus" 2> /dev/null)"
-            echo "$mask" > "$q/rps_cpus" 2> /dev/null
-            echo $(( 32768 / nq )) > "$q/rps_flow_cnt" 2> /dev/null
+            kv_has "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" || kv_set "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" "$(cat "$q/rps_cpus" 2> /dev/null)"
+            if echo "$mask" > "$q/rps_cpus" 2> /dev/null; then okq=1; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); continue; fi
+            echo $(( 32768 / rxq )) > "$q/rps_flow_cnt" 2> /dev/null
         done
-        tune_sysctl net.core.rps_sock_flow_entries 32768
-        kv_set "$TUNE_DIR/nic.conf" "rps:$dev" "$mask"
+        if (( okq )); then tune_sysctl net.core.rps_sock_flow_entries 32768; kv_set "$TUNE_DIR/nic.conf" "rps:$dev" "$mask"; fi
     fi
+    if nic_qdisc_wanted && [[ -n "$(nic_qdisc_targets "$dev")" ]]; then if nic_set_qdisc "$dev"; then TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi; fi
     if command -v ethtool > /dev/null 2>&1; then
-        for f in "generic-receive-offload:gro:on" "generic-segmentation-offload:gso:on" "tcp-segmentation-offload:tso:on" "large-receive-offload:lro:off"; do
-            feat="${f%%:*}"; f="${f#*:}"; st="${f##*:}"; f="${f%%:*}"
+        while read -r feat f st; do
             nic_feature_fixed "$dev" "$feat" && continue
-            [[ -n "$(nic_feature "$dev" "$feat")" && "$(nic_feature "$dev" "$feat")" != "$st" ]] || continue
-            kv_has "$TUNE_DIR/nic.orig" "off:$dev:$f" || kv_set "$TUNE_DIR/nic.orig" "off:$dev:$f" "$(nic_feature "$dev" "$feat")"
-            ethtool -K "$dev" "$f" "$st" > /dev/null 2>&1 && kv_set "$TUNE_DIR/nic.conf" "off:$dev:$f" "$st"
-        done
+            cur=$(nic_feature "$dev" "$feat"); [[ -n "$cur" && "$cur" != "$st" ]] || continue
+            kv_has "$TUNE_DIR/nic.orig" "off:$dev:$f" || kv_set "$TUNE_DIR/nic.orig" "off:$dev:$f" "$cur"
+            if ethtool -K "$dev" "$f" "$st" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "off:$dev:$f" "$st"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
+        done < <(nic_wanted_features)
         if [[ "$rings" == 1 ]]; then
-            local rmax tmax rcur tcur
-            read -r rmax tmax rcur tcur <<< "$(ethtool -g "$dev" 2> /dev/null | awk '/^Pre-set maximums/ { s = 1 } /^Current hardware/ { s = 2 } /^RX:/ { if (s == 1) rm = $2; if (s == 2) rc = $2 } /^TX:/ { if (s == 1) tm = $2; if (s == 2) tc = $2 } END { print rm + 0, tm + 0, rc + 0, tc + 0 }')"
+            local rmax tmax rcur tcur rn tn
+            read -r rmax tmax rcur tcur <<< "$(nic_ring "$dev")"
             if (( rmax > rcur || tmax > tcur )); then
+                rn=$(( rmax > rcur ? rmax : rcur )); tn=$(( tmax > tcur ? tmax : tcur ))        # a dimension the driver cannot raise keeps its value
                 kv_has "$TUNE_DIR/nic.orig" "ring:$dev" || kv_set "$TUNE_DIR/nic.orig" "ring:$dev" "$rcur $tcur"
-                ethtool -G "$dev" rx "$rmax" tx "$tmax" > /dev/null 2>&1 && kv_set "$TUNE_DIR/nic.conf" "ring:$dev" "$rmax $tmax"
+                if ethtool -G "$dev" rx "$rn" tx "$tn" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "ring:$dev" "$rn $tn"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
             fi
         fi
     fi
-    local sq; sq=$(softnet_stat | awk '{ print $2 }')
+    sq=$(softnet_stat | awk '{ print $2 }')
     [[ "$sq" =~ ^[0-9]+$ && "$sq" -gt 0 ]] && tune_raise net.core.netdev_budget 600
     return 0
 }
-nic_restore() {    # boot / heal: put the stored card settings back
+nic_restore() {    # boot / heal: put the stored card settings back (only what is not already in place: a driver may blink the link on any set)
     [[ -s "$TUNE_DIR/nic.conf" ]] || return 0
-    local k v kind dev what
+    local k v kind dev what q rcur tcur
     while IFS='=' read -r k v; do
         kind="${k%%:*}"; dev="${k#*:}"; what="${dev#*:}"; dev="${dev%%:*}"
         [[ -d "$SYSFS_NET/$dev" ]] || continue
         case "$kind" in
-            rps)  local q; for q in "$SYSFS_NET/$dev"/queues/rx-*; do echo "$v" > "$q/rps_cpus" 2> /dev/null; done ;;
-            off)  command -v ethtool > /dev/null 2>&1 && ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 ;;
-            ring) command -v ethtool > /dev/null 2>&1 && ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 ;;
+            rps)  for q in "$SYSFS_NET/$dev"/queues/rx-*; do
+                      [[ "$(nic_norm_mask "$(cat "$q/rps_cpus" 2> /dev/null)")" == "$(nic_norm_mask "$v")" ]] || echo "$v" > "$q/rps_cpus" 2> /dev/null
+                  done ;;
+            off)  command -v ethtool > /dev/null 2>&1 || continue
+                  [[ "$(nic_feature "$dev" "$(nic_feat_name "$what")")" == "$v" ]] || ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 ;;
+            ring) command -v ethtool > /dev/null 2>&1 || continue
+                  read -r _ _ rcur tcur <<< "$(nic_ring "$dev")"
+                  [[ "$rcur $tcur" == "$v" ]] || ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 ;;
             qdisc) nic_set_qdisc "$dev" ;;
         esac
     done < "$TUNE_DIR/nic.conf"
     return 0
 }
 nic_feat_name() { case "$1" in gro) echo generic-receive-offload ;; gso) echo generic-segmentation-offload ;; tso) echo tcp-segmentation-offload ;; lro) echo large-receive-offload ;; *) echo "$1" ;; esac; }
-nic_drift() {    # 0 = a stored card setting (RPS mask, offload) is no longer in effect - the link was re-created, a driver reload, ...
-    local k v kind dev what
+nic_drift() {    # 0 = a stored card setting is gone again (link re-created, driver reloaded) and the card is back at its ORIGINAL value.
+    local k v kind dev what live          # A value somebody else chose on purpose (neither ours nor the original) is not fought over.
     [[ -s "$TUNE_DIR/nic.conf" ]] || return 1
     while IFS='=' read -r k v; do
         kind="${k%%:*}"; dev="${k#*:}"; what="${dev#*:}"; dev="${dev%%:*}"
         [[ -d "$SYSFS_NET/$dev" ]] || continue
         case "$kind" in
-            rps) [[ "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)" == "$v" ]] || return 0 ;;
-            off) [[ "$(nic_feature "$dev" "$(nic_feat_name "$what")")" == "$v" ]] || return 0 ;;
+            rps)  live=$(nic_norm_mask "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)")
+                  [[ "$live" == "$(nic_norm_mask "$v")" ]] && continue
+                  [[ "$live" == "$(nic_norm_mask "$(kv_get "$TUNE_DIR/nic.orig" "rps:$dev:rx-0")")" ]] && return 0 ;;
+            off)  command -v ethtool > /dev/null 2>&1 || continue
+                  live=$(nic_feature "$dev" "$(nic_feat_name "$what")"); [[ -n "$live" && "$live" != "$v" ]] || continue
+                  [[ "$live" == "$(kv_get "$TUNE_DIR/nic.orig" "off:$dev:$what")" ]] && return 0 ;;
+            qdisc) [[ -n "$(nic_qdisc_targets "$dev")" ]] && return 0 ;;
         esac
     done < "$TUNE_DIR/nic.conf"
     return 1
 }
 nic_revert() {
-    local k v kind dev what q n=0
+    local k v kind dev what q n=0 qk qv t
     [[ -s "$TUNE_DIR/nic.orig" ]] && while IFS='=' read -r k v; do
         kind="${k%%:*}"; dev="${k#*:}"; what="${dev#*:}"; dev="${dev%%:*}"
         [[ -d "$SYSFS_NET/$dev" ]] || continue
@@ -2644,7 +2927,12 @@ nic_revert() {
             rps)  q="$what"; echo "$v" > "$SYSFS_NET/$dev/queues/$q/rps_cpus" 2> /dev/null && n=$((n + 1)) ;;
             off)  ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 && n=$((n + 1)) ;;
             ring) ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 && n=$((n + 1)) ;;
-            qdisc) tc qdisc replace dev "$dev" root "$v" 2> /dev/null && n=$((n + 1)) ;;
+            qdisc) read -r qk qv <<< "$v"; [[ -n "$qv" ]] || { qv="$qk"; qk=root; }           # "<root|mq> <qdisc>"; only a queue that still is OUR fq is put back
+                   if [[ "$qk" == mq ]]; then
+                       for t in $(tc qdisc show dev "$dev" 2> /dev/null | awk '$2 == "fq" { for (i = 1; i < NF; i++) if ($i == "parent") print $(i + 1) }'); do
+                           tc qdisc replace dev "$dev" parent "$t" "$qv" 2> /dev/null && n=$((n + 1))
+                       done
+                   elif [[ "$(nic_root_qdisc "$dev")" == fq ]]; then tc qdisc replace dev "$dev" root "$qv" 2> /dev/null && n=$((n + 1)); fi ;;
         esac
     done < "$TUNE_DIR/nic.orig"
     : > "$TUNE_DIR/nic.orig"; : > "$TUNE_DIR/nic.conf"; echo "$n"
@@ -2665,12 +2953,14 @@ assist_nic() {
     else printf "   ${GR}%-30s %-14s    %s${NC}\n" "change" "now" "proposed"; echo "$plan"; echo ""
         echo -e "  ${GR}RPS lets every CPU core process packets of a single-queue card (typical VPS); LRO must be off on a forwarder.${NC}"
         confirm "Apply these changes?" y || return 1
+        tune_count_reset
         for d in $devs; do nic_apply "$d"; done
-        tune_hist nic "network card tuned ($(echo $devs))"; echo -e "  ${G}Done.${NC}"
+        (( TUNE_OK > 0 )) && tune_hist nic "network card tuned ($(echo $devs))"
+        tune_done
     fi
     local dd; for d in $devs; do dd=$(kvget "$(nic_scan "$d")" drops); if [[ "$dd" =~ ^[0-9]+$ ]] && (( dd > 0 )) && command -v ethtool > /dev/null 2>&1; then
         echo -e "\n  ${Y}$d has dropped $dd received packets since boot.${NC} ${GR}Larger ring buffers absorb bursts (may blink the link for a moment).${NC}"
-        confirm "Maximise the ring buffers of $d?" n && { nic_apply "$d" 1; tune_hist nic "ring buffers of $d maximised"; }
+        confirm "Maximise the ring buffers of $d?" n && { tune_count_reset; nic_apply "$d" 1; (( TUNE_OK > 0 )) && tune_hist nic "ring buffers of $d maximised"; tune_done; }
     fi; done
     return 0
 }
@@ -2707,9 +2997,39 @@ profile_realm_unit() {    # a raised priority is refused inside containers, so o
     case "$1" in gaming) echo "Nice=-10" ;; bandwidth) echo "Nice=-5" ;; esac
 }
 port_profile() { ( P_PROFILE=""; source "$PORTS_DIR/$1" 2> /dev/null; echo "${P_PROFILE:-}" ); }
+port_get() {    # port_get <port> <P_KEY> -> its value, read without starting a process per line
+    local k v
+    while IFS='=' read -r k v; do [[ "$k" == "$2" ]] && { v="${v#\"}"; echo "${v%\"}"; return 0; }; done < "$PORTS_DIR/$1" 2> /dev/null
+    return 1
+}
+TUNE_CFG_RE='^P_(PROFILE|TUNE_MTU)="?[^" ]'      # a tunnel line that really carries a profile / pinned MTU
+tune_any_config() { grep -qsE "$TUNE_CFG_RE" "$PORTS_DIR"/* 2> /dev/null; }
+tune_port_table() {    # one line per tunnel, read in ONE pass over the port files: port|destination|method|profile|pinned MTU|blocked
+    local f first=""         # (restore / sync ask for every tunnel; a process per file made that quadratic)
+    for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && { first=1; break; }; done
+    [[ -n "$first" ]] || return 0
+    awk '
+        function flush() { if (port != "") print port "|" d "|" m "|" p "|" t "|" b }
+        FNR == 1 { flush(); port = FILENAME; sub(/^.*\//, "", port); d = ""; m = "iptables"; p = ""; t = ""; b = 0 }
+        /^P_(DEST|METHOD|PROFILE|TUNE_MTU|BLOCKED)=/ {
+            k = substr($0, 1, index($0, "=") - 1); v = substr($0, index($0, "=") + 1); gsub(/^"|"$/, "", v)
+            if (k == "P_DEST") d = v; else if (k == "P_METHOD") m = v; else if (k == "P_PROFILE") p = v
+            else if (k == "P_TUNE_MTU") t = v; else if (k == "P_BLOCKED") b = v
+        }
+        END { flush() }
+    ' "$PORTS_DIR"/* 2> /dev/null
+}
 
-tune_dest_ip() {    # destination of a tunnel as an IP
-    local ip="$1"; valid_ip "$ip" || ip=$(getent ahosts "$1" 2> /dev/null | awk '{ print $1; exit }'); echo "$ip"
+tune_dest_ip() {    # destination of a tunnel as an IP. A name is looked up at most once a minute (cache in $TUNE_DIR/ipcache) and never for longer than 3 s:
+    local h="$1" f ip t now      # restore / sync ask for every tunnel, and a slow resolver must not multiply
+    valid_ip "$h" && { echo "$h"; return 0; }
+    [[ -n "$h" ]] || return 0
+    f="$TUNE_DIR/ipcache/${h//[^A-Za-z0-9._-]/_}"
+    printf -v now '%(%s)T' -1 2> /dev/null || now=$(date +%s)
+    if [[ -r "$f" ]]; then read -r t ip < "$f"; [[ "$t" =~ ^[0-9]+$ ]] && (( now - t < 60 )) && { echo "$ip"; return 0; }; fi
+    ip=$(timeout 3 getent ahosts "$h" 2> /dev/null | awk '{ print $1; exit }')
+    mkdir -p "$TUNE_DIR/ipcache" 2> /dev/null && echo "$now $ip" > "$f" 2> /dev/null
+    echo "$ip"
 }
 tune_route_get() { local fam="-4"; is_ipv6 "$1" && fam="-6"; ip $fam -o route get "$1" 2> /dev/null | head -1; }
 tune_route_set() {    # tune_route_set <ip> <attrs...> -> 0 ok · 1 a route that is not ours is in the way · 2 failed (undone)
@@ -2722,6 +3042,7 @@ tune_route_set() {    # tune_route_set <ip> <attrs...> -> 0 ok · 1 a route that
     # our earlier route would answer the lookup below with its own, possibly stale, next hop: take it away first
     [[ -n "$mine" ]] && ip $fam route del "$ip/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null
     l=$(tune_route_get "$ip"); [[ -n "$l" ]] || return 2
+    [[ "$l" == local* || "$l" == broadcast* ]] && return 0          # an address of this very server: there is no path to tune
     dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$l"); via=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<< "$l"); src=$(sed -n 's/.* src \([^ ]*\).*/\1/p' <<< "$l")
     ip $fam route replace "$ip/$plen" ${via:+via "$via"} dev "$dev" ${src:+src "$src"} proto "$PFM_ROUTE_PROTO" "$@" 2> /dev/null || return 2
     after=$(tune_route_get "$ip")
@@ -2732,22 +3053,21 @@ tune_route_set() {    # tune_route_set <ip> <attrs...> -> 0 ok · 1 a route that
 }
 tune_route_del() { local fam="-4" plen=32; is_ipv6 "$1" && { fam="-6"; plen=128; }; ip $fam route del "$1/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null; return 0; }
 
-tune_dest_attrs() {    # tune_dest_attrs <ip> [port to ignore] -> attributes for the host route to <ip>, merged over all tunnels using it
-    local ip="$1" skip="${2:-}" f p tip best="" rank bestrank=0 mtu="" ri kind devmtu attrs
-    for f in "$PORTS_DIR"/*; do
-        [[ -f "$f" ]] || continue; p=$(basename "$f"); [[ "$p" == "$skip" ]] && continue
-        local P_DEST="" P_METHOD="iptables" P_PROFILE="" P_TUNE_MTU=""; source "$f"
-        tip=$(tune_dest_ip "$P_DEST"); [[ "$tip" == "$ip" ]] || continue
-        if [[ "$P_METHOD" != iptables ]]; then
-            case "$P_PROFILE" in gaming) rank=4 ;; bandwidth) rank=3 ;; multiuser) rank=2 ;; *) rank=0 ;; esac
-            (( rank > bestrank )) && { bestrank=$rank; best="$P_PROFILE"; }
+tune_dest_attrs() {    # tune_dest_attrs <ip> [port to ignore] -> attributes for the host route to <ip>, merged over all tunnels that use it
+    local ip="$1" skip="${2:-}" port d m prof pmtu best="" rank bestrank=0 mtu="" ri kind devmtu attrs
+    while IFS='|' read -r port d m prof pmtu _; do
+        [[ -n "$port" && "$port" != "$skip" && -n "$prof$pmtu" ]] || continue       # an untuned tunnel adds nothing - and is not even resolved
+        [[ "$(tune_dest_ip "$d")" == "$ip" ]] || continue
+        if [[ "$m" != iptables ]]; then
+            case "$prof" in gaming) rank=4 ;; bandwidth) rank=3 ;; multiuser) rank=2 ;; *) rank=0 ;; esac
+            (( rank > bestrank )) && { bestrank=$rank; best="$prof"; }
         fi
-        [[ "$P_TUNE_MTU" =~ ^[0-9]+$ ]] && { [[ -z "$mtu" ]] || (( P_TUNE_MTU < mtu )) && mtu="$P_TUNE_MTU"; }
-    done
+        [[ "$pmtu" =~ ^[0-9]+$ ]] && { [[ -z "$mtu" ]] || (( pmtu < mtu )) && mtu="$pmtu"; }
+    done < <(tune_port_table)
     attrs=$(profile_route_attrs "$best")
     if [[ -n "$mtu" ]]; then       # pin the MTU on the route only where lowering the device would hurt other traffic
         ri=$(probe_route "$ip"); kind=$(kvget "$ri" kind); devmtu=$(kvget "$ri" devmtu)
-        [[ ! "$kind" =~ ^(gre|gretap|ipip|sit|wireguard|vxlan|ip6gre|ip6tnl|geneve)$ && "$devmtu" =~ ^[0-9]+$ ]] && (( mtu < devmtu )) && attrs="$attrs mtu lock $mtu"
+        [[ ! "$kind" =~ ^(gre|gretap|ipip|sit|wireguard|vxlan|ip6gre|ip6gretap|ip6tnl|geneve)$ && "$devmtu" =~ ^[0-9]+$ ]] && (( mtu < devmtu )) && attrs="$attrs mtu lock $mtu"
     fi
     echo $attrs
 }
@@ -2764,21 +3084,37 @@ tune_route_note() {    # tells why the route part of a change could not be appli
         2) echo -e "  ${Y}Note: the kernel refused the route settings (container or restricted host); the other parts were applied.${NC}" ;;
     esac
 }
-tune_mss_remove() { local c; for c in iptables ip6tables; do ipt_del_tag "$c" mangle FORWARD "pfm_mss_$1"; done; }
+tune_mss_listed() { local l; while read -r l; do [[ "$l" == "$1" ]] && return 0; done < "$TUNE_DIR/mss.ports" 2> /dev/null; return 1; }
+tune_mss_mark() {    # tune_mss_mark add|del <port>: mss.ports lists the tunnels that have MSS rules, so the others never pay for a look at the firewall
+    local t
+    if [[ "$1" == add ]]; then tune_mss_listed "$2" || echo "$2" >> "$TUNE_DIR/mss.ports"
+    else t=$(mktemp "$TUNE_DIR/mss.XXXXXX") && { grep -vx "$2" "$TUNE_DIR/mss.ports" > "$t" 2> /dev/null; mv -f "$t" "$TUNE_DIR/mss.ports"; }; fi
+    return 0
+}
+tune_mss_remove() {
+    local c
+    [[ -d "$TUNE_DIR" ]] || return 0                                                  # the assistant was never used here
+    [[ -f "$TUNE_DIR/mss.ports" ]] && ! tune_mss_listed "$1" && return 0         # this tunnel never had any
+    for c in iptables ip6tables; do ipt_del_tag "$c" mangle FORWARD "pfm_mss_$1"; done
+    tune_mss_mark del "$1"
+}
 tune_mss_apply() {    # kernel-NAT-ed connections only: realm/HAProxy open their own connections and take the MSS from the route
     local port="$1"; [[ -f "$PORTS_DIR/$port" ]] || return 0
     local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_TUNE_MTU=""; source "$PORTS_DIR/$port"
     tune_mss_remove "$port"
     [[ "$P_METHOD" == iptables && "$P_TUNE_MTU" =~ ^[0-9]+$ ]] || return 0
     local cmd mss; cmd=$(ipt "$P_DEST"); mss=$(( P_TUNE_MTU - 40 )); is_ipv6 "$P_DEST" && mss=$(( P_TUNE_MTU - 60 ))
+    tune_init; tune_mss_mark add "$port"        # listed before the rules exist: a half-done change is still cleaned up
     # "set-mss" never raises an MSS that is already lower; both directions, because the SYN-ACK leaves through the other interface
     $cmd -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -d "$P_DEST" --dport "$P_DPORT" -m comment --comment "pfm_mss_${port}" -j TCPMSS --set-mss "$mss" 2> /dev/null
     $cmd -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -s "$P_DEST" --sport "$P_DPORT" -m comment --comment "pfm_mss_${port}" -j TCPMSS --set-mss "$mss" 2> /dev/null
     return 0
 }
-tune_apply_tunnel() {    # called whenever a tunnel's rules are (re)applied: route attributes + MSS from the stored profile / MTU
-    local port="$1"; [[ -f "$PORTS_DIR/$port" ]] || return 0
-    local P_DEST="" ip; P_DEST=$(. "$PORTS_DIR/$port" 2> /dev/null; echo "$P_DEST")
+tune_apply_tunnel() {    # tune_apply_tunnel <port> [force]: route attributes + MSS from the stored profile / MTU. Called whenever a tunnel's rules are (re)applied,
+    local port="$1" force="${2:-}" P_DEST="" ip      # so it costs next to nothing on a server whose tunnels were never tuned ("force": the caller just changed or cleared them)
+    [[ -f "$PORTS_DIR/$port" ]] || return 0
+    [[ -n "$force" ]] || tune_any_config || [[ -s "$TUNE_DIR/mss.ports" ]] || return 0
+    P_DEST=$(port_get "$port" P_DEST)
     ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || return 0
     tune_apply_dest "$ip"; tune_mss_apply "$port"
     return 0
@@ -2786,17 +3122,25 @@ tune_apply_tunnel() {    # called whenever a tunnel's rules are (re)applied: rou
 tune_remove_tunnel() {    # a tunnel is being removed: its MSS rules go, the route is recomputed without it
     local port="$1" P_DEST ip
     tune_mss_remove "$port"
-    P_DEST=$(. "$PORTS_DIR/$port" 2> /dev/null; echo "$P_DEST"); ip=$(tune_dest_ip "$P_DEST")
+    tune_any_config || return 0         # nothing is tuned anywhere, so there is no route of ours to recompute
+    P_DEST=$(port_get "$port" P_DEST); ip=$(tune_dest_ip "$P_DEST")
     [[ -n "$ip" ]] && tune_apply_dest "$ip" "$port"
     return 0
 }
 
 assist_profile_set() {    # assist_profile_set <port> <profile>
     local port="$1" prof="$2" lbl what
-    [[ -f "$PORTS_DIR/$port" ]] || return 1
-    local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_PROFILE=""; source "$PORTS_DIR/$port"
+    case "$prof" in gaming|bandwidth|balanced|multiuser) ;; *) echo -e "  ${R}Unknown profile '${prof}' - use gaming, bandwidth, balanced or multiuser.${NC}"; return 1 ;; esac
+    valid_port "$port" && [[ -f "$PORTS_DIR/$port" ]] || { echo -e "  ${R}There is no tunnel on port '${port}'.${NC}"; return 1; }
+    local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_PROFILE="" P_BLOCKED=0; source "$PORTS_DIR/$port"
     IFS='|' read -r lbl what <<< "$(profile_info "$prof")"
     echo -e "\n  ${B}${W}Tune :$port → ${P_DEST}:${P_DPORT} [$P_METHOD]${NC}   ${C}$lbl${NC}\n  ${GR}$what${NC}\n"
+    if [[ "$P_METHOD" == iptables ]]; then
+        echo -e "  ${Y}Profiles need the realm or HAProxy engine.${NC}"
+        echo -e "  ${GR}Kernel NAT (iptables) forwards packets without ever terminating the connection, so the only per-tunnel setting it has is the TCP MSS ('MTU auto-tune').${NC}"
+        echo -e "  ${GR}Server-wide settings - BBR, buffers, network card - are the other items of the Optimization Assistant.${NC}"
+        return 1
+    fi
     echo -e "  ${GR}What changes for this tunnel:${NC}"
     case "$P_METHOD" in
         realm)   echo -e "   • route to ${P_DEST}: $(profile_route_attrs "$prof" | sed 's/^$/(default)/')"
@@ -2805,12 +3149,15 @@ assist_profile_set() {    # assist_profile_set <port> <profile>
                  echo -e "   ${Y}• the realm service restarts (connections of this tunnel reconnect)${NC}" ;;
         haproxy) echo -e "   • route to ${P_DEST}: $(profile_route_attrs "$prof" | sed 's/^$/(default)/')"
                  echo -e "   • HAProxy keep-alive / timeouts / limits for this tunnel (graceful reload)" ;;
-        *)       echo -e "   • kernel NAT has no per-tunnel knobs except the TCP MSS (set by 'MTU auto-tune')."
-                 echo -e "   ${GR}  For per-tunnel control of latency/bandwidth use the realm or HAProxy engine.${NC}" ;;
     esac
+    [[ "$P_BLOCKED" == 1 ]] && echo -e "   ${Y}• this tunnel is blocked right now: the profile is only stored and takes effect when it is unblocked${NC}"
     local curp; curp=$(port_profile "$port"); [[ "${curp:-balanced}" != "$prof" ]] || { echo -e "\n  ${G}This profile is already active.${NC}"; return 0; }
     confirm "Apply profile '$lbl'?" y || return 1
     if [[ "$prof" == balanced ]]; then port_unset "$port" P_PROFILE; else port_set "$port" P_PROFILE "$prof"; fi
+    if [[ "$P_BLOCKED" == 1 ]]; then       # starting a blocked tunnel's engine would open it again: store only
+        tune_hist profile ":$port -> $lbl (stored; tunnel is blocked)"
+        echo -e "  ${G}Stored.${NC} ${GR}It is applied when the tunnel is unblocked (or after 'pfm restore').${NC}"; return 0
+    fi
     local up=1
     case "$P_METHOD" in
         realm)   create_realm_service "$port" "$P_DEST" "$P_DPORT" 0; start_realm_service "$port"; wait_engine "$port" realm 6 || up=0 ;;
@@ -2823,10 +3170,10 @@ assist_profile_set() {    # assist_profile_set <port> <profile>
             realm)   create_realm_service "$port" "$P_DEST" "$P_DPORT" 0; start_realm_service "$port"; wait_engine "$port" realm 6 ;;
             haproxy) rebuild_haproxy_cfg > /dev/null 2>&1 ;;
         esac
-        tune_apply_tunnel "$port"
+        tune_apply_tunnel "$port" force
         return 1
     fi
-    tune_apply_tunnel "$port"
+    tune_apply_tunnel "$port" force
     tune_hist profile ":$port -> $lbl"
     echo -e "  ${G}Profile applied.${NC} ${GR}Run the Bench Test to measure the effect.${NC}"
     tune_route_note
@@ -2835,16 +3182,25 @@ assist_profile_set() {    # assist_profile_set <port> <profile>
 # ── MTU auto-tune ──
 tunnel_kind_is_tunnel() { [[ "$1" =~ ^(gre|gretap|ipip|sit|wireguard|vxlan|ip6gre|ip6gretap|ip6tnl|geneve)$ ]]; }
 assist_mtu() {    # assist_mtu <port>
-    local port="$1" ip ri dev kind devmtu ovh remote inner pm bh target umtu upath cap note=""
-    [[ -f "$PORTS_DIR/$port" ]] || return 1
+    local port="$1" ip ri dev kind devmtu ovh remote inner pm bh target umtu upath cap note="" floor=576 had=0 fam="-4" plen=32
+    valid_port "$port" && [[ -f "$PORTS_DIR/$port" ]] || { echo -e "  ${R}There is no tunnel on port '${port}'.${NC}"; return 1; }
     local P_DEST="" P_METHOD="iptables" P_TUNE_MTU=""; source "$PORTS_DIR/$port"
     ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || { echo -e "  ${R}Destination does not resolve.${NC}"; return 1; }
-    ensure_tool ping "MTU test" > /dev/null || { echo -e "  ${R}ping is required.${NC}"; return 1; }
+    is_ipv6 "$ip" && { floor=1280; fam="-6"; plen=128; }
+    ensure_tool ping "MTU test" || { echo -e "  ${R}ping is required.${NC}"; return 1; }
     ri=$(probe_route "$ip"); dev=$(kvget "$ri" dev); kind=$(kvget "$ri" kind); devmtu=$(kvget "$ri" devmtu); ovh=$(kvget "$ri" overhead); remote=$(kvget "$ri" remote)
+    [[ "$devmtu" =~ ^[0-9]+$ ]] && (( devmtu > 0 )) || { echo -e "  ${R}No route to $ip.${NC}"; return 1; }
     echo -e "\n  ${B}${W}MTU auto-tune${NC}  ${GR}:$port → $ip  via $dev ($kind, MTU $devmtu)${NC}\n"
     echo -ne "  ${GR}Measuring the path with DF-bit probes...${NC}"
-    inner=$(probe_mtu "$ip" "$devmtu"); pm=$(kvget "$inner" pmtu); bh=$(kvget "$inner" blackhole)
+    # a pin made by an earlier run would cap the probes themselves: measure without it, put it back right after
+    [[ -n "$(ip $fam route show exact "$ip/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null)" ]] && { had=1; tune_route_del "$ip"; }
+    inner=$(probe_mtu "$ip" "$devmtu"); (( had )) && tune_apply_dest "$ip"
+    pm=$(kvget "$inner" pmtu); bh=$(kvget "$inner" blackhole)
     if [[ "$(kvget "$inner" icmp)" == blocked ]]; then echo -e "\r  ${Y}ICMP is filtered towards $ip - the MTU cannot be measured reliably.${NC}                "; return 1; fi
+    if [[ "$(kvget "$inner" unreliable)" == 1 ]]; then
+        echo -e "\r  ${Y}The measurement is not reliable: replies were lost or rate-limited, the path seemed to carry only $pm bytes (no real network is that small).${NC}"
+        echo -e "  ${GR}Nothing was changed. Try again in a minute.${NC}"; return 1
+    fi
     echo -e "\r  Path to the destination ......... ${W}$pm${NC} bytes   ${GR}(interface $devmtu, black hole: $([[ "$bh" == 1 ]] && echo YES || echo no))${NC}        "
     target=$devmtu
     [[ "$pm" =~ ^[0-9]+$ ]] && (( pm < target )) && target=$pm
@@ -2854,22 +3210,32 @@ assist_mtu() {    # assist_mtu <port>
         if [[ "$udev" =~ ^[0-9]+$ ]]; then
             echo -ne "  ${GR}Measuring the underlay path to the tunnel endpoint $remote ...${NC}"
             umtu=$(probe_mtu "$remote" "$udev"); upath=$(kvget "$umtu" pmtu)
-            if [[ "$upath" =~ ^[0-9]+$ ]]; then
+            if [[ "$upath" =~ ^[0-9]+$ && "$(kvget "$umtu" unreliable)" != 1 ]]; then
                 cap=$(( upath - ovh ))
                 echo -e "\r  Underlay to $remote ... ${W}$upath${NC} bytes - $kind overhead $ovh = ${W}$cap${NC} for the tunnel        "
                 (( cap < target )) && target=$cap
                 (( cap > devmtu )) && note="The tunnel could carry up to $cap bytes (+$(( (cap - devmtu) * 100 / devmtu ))%), but both ends must be changed together - not done automatically."
-            else echo -e "\r  ${GR}Underlay path not measurable (ICMP filtered at $remote).${NC}                "; fi
+            else echo -e "\r  ${GR}Underlay path not measurable (ICMP filtered or unreliable at $remote).${NC}                "; fi
         fi
     fi
     echo -e "\n  Recommended inner MTU ........... ${B}${C}$target${NC}   ${GR}(now $devmtu)${NC}"
     [[ -n "$note" ]] && echo -e "  ${GR}$note${NC}"
+    if (( target < floor )) || { tunnel_kind_is_tunnel "$kind" && (( target < 1280 )) && (( target < devmtu )); }; then
+        echo -e "\n  ${Y}$target bytes is below what IPv4/IPv6 need ($(tunnel_kind_is_tunnel "$kind" && echo 1280 || echo "$floor")): a tunnel interface that small drops IPv6.${NC} ${GR}Nothing was changed - check the underlay by hand.${NC}"
+        return 1
+    fi
     if [[ "$P_TUNE_MTU" == "$target" ]] && ! tunnel_kind_is_tunnel "$kind"; then
-        echo -e "\n  ${G}This MTU is already pinned for the tunnel.${NC}"; return 0
+        echo -e "\n  ${G}This MTU is already pinned for the tunnel and still matches the path.${NC}"; return 0
     fi
     if (( target >= devmtu )) && [[ "$bh" != 1 ]]; then
         echo -e "\n  ${G}The MTU is already right for this path.${NC}"
-        [[ -n "$P_TUNE_MTU" ]] && echo -e "  ${GR}(a pinned value of $P_TUNE_MTU from an earlier run is still in place)${NC}"
+        if [[ -n "$P_TUNE_MTU" ]]; then
+            echo -e "  ${GR}A pinned value of $P_TUNE_MTU from an earlier run is still in place, but the path carries the full $devmtu now.${NC}"
+            if confirm "Remove that pin?" y; then
+                port_unset "$port" P_TUNE_MTU; tune_apply_tunnel "$port" force
+                tune_hist mtu ":$port pinned MTU $P_TUNE_MTU removed (the path carries $devmtu)"; echo -e "  ${G}Removed.${NC}"
+            fi
+        fi
         return 0
     fi
     echo ""
@@ -2882,7 +3248,7 @@ assist_mtu() {    # assist_mtu <port>
     confirm "Apply?" y || return 1
     if tunnel_kind_is_tunnel "$kind"; then save_mtu "$dev" "$target"; kv_set "$TUNE_DIR/mtu.devs" "$dev" 1; fi
     port_set "$port" P_TUNE_MTU "$target"
-    tune_apply_tunnel "$port"
+    tune_apply_tunnel "$port" force
     tune_hist mtu ":$port path MTU $pm -> pinned $target on $dev"
     inner=$(probe_mtu "$ip" "$target")
     echo -e "  ${G}Applied.${NC} ${GR}Check: $(kvget "$inner" pmtu) bytes cross the path now. Run the Bench Test to measure the effect.${NC}"
@@ -2901,7 +3267,7 @@ assist_mss() {    # assist_mss <port>
     echo -e "  ${GR}Kernel-NAT-ed connections are not terminated here, so nobody lowers their MSS if the path is smaller than 1500;${NC}"
     echo -e "  ${GR}big packets then vanish (PMTU black hole). Clamping the SYN's MSS to $(( mtu - 40 )) (MTU $mtu) prevents that.${NC}\n"
     confirm "Clamp the MSS of :$port to $(( mtu - 40 ))?" y || return 1
-    port_set "$port" P_TUNE_MTU "$mtu"; tune_apply_tunnel "$port"
+    port_set "$port" P_TUNE_MTU "$mtu"; tune_apply_tunnel "$port" force
     tune_hist mss ":$port TCP MSS clamped to $(( mtu - 40 ))"
     echo -e "  ${G}Done.${NC}"
 }
@@ -2965,40 +3331,48 @@ dns_query() {    # dns_query <ip[#port]> <name> -> "<STATUS> <ms> <ips>"
     echo "$st ${ms:-0} ${ips%,}"
 }
 med() { awk '{ for (i = 1; i <= NF; i++) v[++n] = $i } END { if (n == 0) { print -1; exit } for (i = 2; i <= n; i++) { t = v[i]; for (j = i - 1; j >= 1 && v[j] > t; j--) v[j+1] = v[j]; v[j+1] = t } print v[int((n + 1) / 2)] }' <<< "$1"; }
-dns_bench_one() {    # dns_bench_one <spec> <domains...> -> spec|ok|total|warm ms|fresh ms|bogus|nxdomain-rewrites|alive
+dns_bench_one() {    # dns_bench_one <spec> <domains...> ("!name" = a name a tunnel needs - it must resolve) -> spec|ok|total|warm ms|fresh ms|bogus|nxdomain-rewrites|alive|required failures
     local spec="$1"; shift
-    local d r st ms ips i ok=0 tot=0 bogus=0 nx=0 warm="" cold="" n=0 name
-    r=$(dns_query "$spec" "$1")
-    [[ "${r%% *}" == TIMEOUT ]] && { echo "$spec|0|0|-1|-1|0|0|0"; return 0; }
+    local d r st ms ips i ok=0 tot=0 bogus=0 nx=0 warm="" cold="" n=0 name req rfail=0
+    r=$(dns_query "$spec" "${1#!}")
+    [[ "${r%% *}" == TIMEOUT ]] && { echo "$spec|0|0|-1|-1|0|0|0|0"; return 0; }
     for d in "$@"; do
+        req=0; [[ "$d" == '!'* ]] && { req=1; d="${d#!}"; }
         tot=$((tot + 1)); dns_query "$spec" "$d" > /dev/null; r=$(dns_query "$spec" "$d")     # the second answer comes from the resolver's cache
         read -r st ms ips <<< "$r"
         if [[ "$st" == NOERROR && -n "$ips" ]]; then
             ok=$((ok + 1)); warm+=" $ms"
-            for i in ${ips//,/ }; do dns_bogon "$i" && bogus=$((bogus + 1)); done
-        fi
+            # a tunnel's own name may point to a private address on purpose; only public names are judged by that
+            (( req )) || for i in ${ips//,/ }; do dns_bogon "$i" && bogus=$((bogus + 1)); done
+        elif (( req )); then rfail=$((rfail + 1)); fi
     done
     for d in "$@"; do    # a name that cannot exist forces a real lookup; a resolver that "finds" it rewrites NXDOMAIN
+        [[ "$d" == '!'* ]] && continue
         (( n >= 3 )) && break; n=$((n + 1)); name="pfmx${RANDOM}${RANDOM}.$d"
         read -r st ms ips <<< "$(dns_query "$spec" "$name")"
         case "$st" in NXDOMAIN) cold+=" $ms" ;; NOERROR) [[ -n "$ips" ]] && nx=$((nx + 1)) ;; esac
     done
-    echo "$spec|$ok|$tot|$(med "$warm")|$(med "$cold")|$bogus|$nx|1"
+    echo "$spec|$ok|$tot|$(med "$warm")|$(med "$cold")|$bogus|$nx|1|$rfail"
 }
 RESOLVED_DIR="${PFM_RESOLVED_DIR:-/etc/systemd/resolved.conf.d}"        # drop-in directories (tests point these at a scratch tree)
 RESOLVED_RUN="${PFM_RESOLVED_RUN:-/run/systemd/resolve}"
 NM_DIR="${PFM_NM_DIR:-/etc/NetworkManager/conf.d}"
-dns_mode() {
+dns_mode() {    # resolved / nm / classic = we can change it · symlink / managed = another tool owns resolv.conf: we only say what to set
     if systemctl is-active --quiet systemd-resolved > /dev/null 2>&1 && [[ "$(readlink -f "$RESOLV_CONF" 2> /dev/null)" == "$RESOLVED_RUN"/* ]]; then echo resolved
-    elif systemctl is-active --quiet NetworkManager > /dev/null 2>&1 && grep -qi networkmanager "$RESOLV_CONF" 2> /dev/null; then echo nm
+    elif grep -qi networkmanager "$RESOLV_CONF" 2> /dev/null; then
+        # plain NetworkManager lists real nameservers; a local stub (dnsmasq / resolved plugin) or a symlink means a setup we must not reshape
+        if systemctl is-active --quiet NetworkManager > /dev/null 2>&1 && [[ ! -L "$RESOLV_CONF" ]] && ! grep -q '^nameserver 127\.' "$RESOLV_CONF" 2> /dev/null; then echo nm; else echo managed; fi
     elif [[ -L "$RESOLV_CONF" ]]; then echo symlink
     else echo classic; fi
 }
 dns_current_line() { dns_system_resolvers | tr '\n' ' '; }
+dns_write_file() { cat "$2" > "$1" 2> /dev/null && cmp -s "$2" "$1"; }          # dns_write_file <target> <content file>: written AND read back
 dns_apply() {    # dns_apply <ip1> [ip2 ...]
-    local mode backup="$TUNE_DIR/dns.orig" servers="$*" t
-    mode=$(dns_mode); tune_init; mkdir -p "$backup"
-    if [[ ! -e "$backup/mode" ]]; then
+    local mode backup="$TUNE_DIR/dns.orig" servers="$*" t ip keep="" cur
+    mode=$(dns_mode); tune_init
+    case "$mode" in symlink|managed) echo -e "  ${Y}$RESOLV_CONF is managed by another tool (a symlink / NetworkManager plugin / resolvconf). Set these resolvers there instead: ${servers}${NC}"; return 1 ;; esac
+    if [[ ! -s "$TUNE_DIR/dns.conf" ]]; then        # nothing of ours is active: this is the moment to remember the original (an older backup would be stale)
+        rm -rf "$backup"; mkdir -p "$backup"
         echo "$mode" > "$backup/mode"; [[ -f "$RESOLV_CONF" ]] && cp -P "$RESOLV_CONF" "$backup/resolv.conf" 2> /dev/null
     fi
     case "$mode" in
@@ -3008,45 +3382,59 @@ dns_apply() {    # dns_apply <ip1> [ip2 ...]
             systemctl restart systemd-resolved 2> /dev/null ;;
         nm)
             mkdir -p "$NM_DIR"
-            printf '[main]\ndns=default\n\n[global-dns-domain-*]\nservers=%s\n' "${servers// /,}" > "$NM_DIR/90-pfm-dns.conf"
-            systemctl reload NetworkManager 2> /dev/null || systemctl restart NetworkManager 2> /dev/null ;;
+            printf '[global-dns-domain-*]\nservers=%s\n' "${servers// /,}" > "$NM_DIR/90-pfm-dns.conf"
+            systemctl reload NetworkManager 2> /dev/null || { rm -f "$NM_DIR/90-pfm-dns.conf"; echo -e "  ${R}NetworkManager did not accept the change.${NC}"; return 1; } ;;
         classic)
-            t=$(mktemp)
-            { for ip in $servers; do echo "nameserver $ip"; done; grep -v '^nameserver' "$RESOLV_CONF" 2> /dev/null; } > "$t"
-            cat "$t" > "$RESOLV_CONF"; rm -f "$t" ;;
-        *)  echo -e "  ${Y}$RESOLV_CONF is managed by another tool (a symlink). Set these resolvers there: ${servers}${NC}"; return 1 ;;
+            # our resolvers first, then the ORIGINAL first resolver as a fallback (a private / DHCP resolver that still answers when ours is unreachable), then search/options lines
+            for ip in $(awk '/^nameserver/ { print $2 }' "$backup/resolv.conf" 2> /dev/null); do [[ " $servers " == *" $ip "* ]] || { keep="$ip"; break; }; done
+            t=$(mktemp) || return 1
+            { for ip in $servers; do echo "nameserver $ip"; done; [[ -n "$keep" ]] && echo "nameserver $keep"; grep -v '^nameserver' "$RESOLV_CONF" 2> /dev/null; } > "$t"
+            if ! dns_write_file "$RESOLV_CONF" "$t"; then
+                echo -e "  ${R}Could not write $RESOLV_CONF - putting the old content back.${NC}"
+                [[ -f "$backup/resolv.conf" ]] && cat "$backup/resolv.conf" > "$RESOLV_CONF" 2> /dev/null
+                rm -f "$t"; return 1
+            fi
+            rm -f "$t" ;;
     esac
     kv_set "$TUNE_DIR/dns.conf" servers "$servers"; kv_set "$TUNE_DIR/dns.conf" mode "$mode"
     return 0
 }
-dns_revert() {
-    local backup="$TUNE_DIR/dns.orig" mode
-    [[ -e "$backup/mode" ]] || { echo 0; return 0; }
-    mode=$(cat "$backup/mode")
-    case "$mode" in
-        resolved) rm -f "$RESOLVED_DIR/90-pfm-dns.conf"; systemctl restart systemd-resolved 2> /dev/null ;;
-        nm)       rm -f "$NM_DIR/90-pfm-dns.conf"; systemctl reload NetworkManager 2> /dev/null ;;
-        classic)  [[ -f "$backup/resolv.conf" ]] && cat "$backup/resolv.conf" > "$RESOLV_CONF" ;;
-    esac
-    rm -rf "$backup"; rm -f "$TUNE_DIR/dns.conf"; echo 1
+dns_revert() {    # puts back what is actually in effect (not what was planned); prints how many things were restored
+    local backup="$TUNE_DIR/dns.orig" mode n=0
+    [[ -s "$TUNE_DIR/dns.conf" || -d "$backup" ]] || { echo 0; return 0; }
+    mode=$(kv_get "$TUNE_DIR/dns.conf" mode); [[ -n "$mode" ]] || mode=$(cat "$backup/mode" 2> /dev/null)
+    if [[ -f "$RESOLVED_DIR/90-pfm-dns.conf" ]]; then rm -f "$RESOLVED_DIR/90-pfm-dns.conf"; systemctl restart systemd-resolved 2> /dev/null; n=$((n + 1)); fi
+    if [[ -f "$NM_DIR/90-pfm-dns.conf" ]]; then rm -f "$NM_DIR/90-pfm-dns.conf"; systemctl reload NetworkManager 2> /dev/null; n=$((n + 1)); fi
+    if [[ "$mode" == classic && -f "$backup/resolv.conf" ]]; then
+        if [[ -L "$RESOLV_CONF" ]]; then log "dns revert: $RESOLV_CONF is a symlink now (another tool took it over) - left alone"
+        elif dns_write_file "$RESOLV_CONF" "$backup/resolv.conf"; then n=$((n + 1)); fi
+    fi
+    rm -rf "$backup"; rm -f "$TUNE_DIR/dns.conf"; echo "$n"
 }
-dns_heal() {    # a DHCP client or cloud-init may rewrite a plain resolv.conf: put ours back
+dns_heal() {    # a DHCP client or cloud-init may rewrite a plain resolv.conf: put ours back (never over a file another tool owns, never when our resolver stopped answering)
     [[ -s "$TUNE_DIR/dns.conf" ]] || return 0
     [[ "$(kv_get "$TUNE_DIR/dns.conf" mode)" == classic ]] || return 0
-    local want first; want=$(kv_get "$TUNE_DIR/dns.conf" servers); first=$(awk '/^nameserver/ { print $2; exit }' "$RESOLV_CONF" 2> /dev/null)
+    local want first r; want=$(kv_get "$TUNE_DIR/dns.conf" servers); first=$(awk '/^nameserver/ { print $2; exit }' "$RESOLV_CONF" 2> /dev/null)
     [[ "$first" == "${want%% *}" ]] && return 0
-    dns_apply $want && log "HEAL dns: resolv.conf had been rewritten, restored $want"
+    [[ -L "$RESOLV_CONF" ]] && return 0
+    r=$(dns_query "${want%% *}" github.com); [[ "${r%% *}" == TIMEOUT ]] && { log "HEAL dns skipped: ${want%% *} does not answer (the system's own resolver stays)"; return 0; }
+    dns_apply $want > /dev/null && log "HEAL dns: resolv.conf had been rewritten, restored $want"
+}
+dns_verify() {    # after a change: the new first resolver answers AND the system resolves a name through it
+    [[ -n "${PFM_DNS_VERIFY_CMD:-}" ]] && { eval "$PFM_DNS_VERIFY_CMD" > /dev/null 2>&1; return; }
+    local r; r=$(dns_query "$1" github.com); [[ "${r%% *}" == NOERROR ]] || return 1
+    timeout 6 getent hosts github.com > /dev/null 2>&1
 }
 assist_dns() {
     ensure_tool dig "DNS benchmark" || return 1
-    local doms=(github.com cloudflare.com google.com telegram.org) f ip name tmp i=0 specs=() labels=()
-    for f in "$PORTS_DIR"/*; do    # the names the tunnels themselves resolve
+    local doms=(github.com cloudflare.com google.com telegram.org) f ip name tmp i=0 specs=() labels=() h hn=0
+    for f in "$PORTS_DIR"/*; do    # the names the tunnels themselves resolve: a resolver that cannot answer them is not an option
         [[ -f "$f" ]] || continue
-        local P_DEST=""; P_DEST=$(. "$f" 2> /dev/null; echo "$P_DEST")
-        valid_ip "$P_DEST" || doms+=("$P_DEST")
+        h=$(port_get "${f##*/}" P_DEST)
+        valid_ip "$h" || [[ -z "$h" ]] || { doms+=("!$h"); hn=$((hn + 1)); }
     done
-    echo -e "\n  ${B}${W}DNS benchmark${NC}\n  ${GR}Each resolver is asked ${#doms[@]} names twice (cache speed) and 3 names that cannot exist (real lookup speed).${NC}"
-    echo -e "  ${GR}A resolver that answers a public name with a private address, or invents answers for missing names, is rejected.${NC}\n"
+    echo -e "\n  ${B}${W}DNS benchmark${NC}\n  ${GR}Each resolver is asked $(( ${#doms[@]} - hn )) public names twice (cache speed) and 3 names that cannot exist (real lookup speed)$( ((hn)) && echo ", plus $hn name(s) your tunnels use" ).${NC}"
+    echo -e "  ${GR}A resolver that answers a public name with a private address, invents answers for missing names, or cannot resolve your tunnels' names is rejected.${NC}\n"
     tmp=$(mktemp -d)
     while IFS='|' read -r name ips; do for ip in $ips; do specs+=("$ip"); labels+=("$name"); done; done < <(dns_candidates)
     for ip in $(dns_system_resolvers); do specs+=("$ip"); labels+=("(system)"); done
@@ -3055,12 +3443,13 @@ assist_dns() {
     wait "${pids[@]}" 2> /dev/null
     local rows=() sc
     for ((i = 0; i < ${#specs[@]}; i++)); do
-        IFS='|' read -r spec ok tot warm fresh bogus nx alive < "$tmp/$i"
+        IFS='|' read -r spec ok tot warm fresh bogus nx alive rfail < "$tmp/$i"
         [[ -n "$spec" ]] || continue
         local note="" score=999999
         if (( alive == 0 )); then note="no answer (blocked / down)"
         elif (( bogus > 0 )); then note="returns private addresses - filtered/hijacked"
         elif (( nx > 0 )); then note="rewrites NXDOMAIN answers"
+        elif (( ${rfail:-0} > 0 )); then note="cannot resolve ${rfail} name(s) your tunnels use"
         elif (( tot > 0 && ok * 100 / tot < 80 )); then note="fails $((tot - ok)) of $tot lookups"
         else score=$(awk -v w="$warm" -v c="$fresh" 'BEGIN { if (c < 0) c = w * 3; if (w < 0) w = c; printf "%d", w * 0.4 + c * 0.6 + 0.5 }'); fi
         rows+=("$(printf '%06d|%s|%s|%s|%s|%s/%s|%s' "$score" "${labels[i]}" "$spec" "$warm" "$fresh" "$ok" "$tot" "$note")")
@@ -3079,9 +3468,11 @@ assist_dns() {
     if (( ${#best_ip[@]} == 0 )); then echo -e "  ${R}No resolver passed. Keep the current one.${NC}"; return 1; fi
     echo -e "  ${GR}Current: $(dns_current_line)${NC}"
     echo -e "  ${GR}Proposed: ${best_ip[*]}   (mode: $(dns_mode))${NC}"
+    [[ "$(dns_mode)" == classic ]] && echo -e "  ${GR}The first of your current resolvers stays behind them as a fallback.${NC}"
     confirm "Use these resolvers?" y || return 1
     dns_apply "${best_ip[@]}" || return 1
-    if eval "${PFM_DNS_VERIFY_CMD:-timeout 6 getent hosts github.com}" > /dev/null 2>&1; then tune_hist dns "resolvers -> ${best_ip[*]}"; echo -e "  ${G}Done.${NC} ${GR}Undo: Optimization Assistant -> Status & revert.${NC}"
+    sleep 1
+    if dns_verify "${best_ip[0]}"; then tune_hist dns "resolvers -> ${best_ip[*]}"; echo -e "  ${G}Done.${NC} ${GR}Undo: Optimization Assistant -> Status & revert.${NC}"
     else echo -e "  ${R}Name resolution failed with the new resolvers - restoring the old ones.${NC}"; dns_revert > /dev/null; return 1; fi
 }
 
@@ -3093,7 +3484,7 @@ scan_row() {    # scan_row ok|warn|bad|info <label> <value> [hint]
 }
 assist_scan() {
     local virt cc qd rmax mem ct cm dev nfo n_ip=0 n_rl=0 n_ha=0 f
-    virt=$(systemd-detect-virt 2> /dev/null || echo none)
+    virt=$(systemd-detect-virt 2> /dev/null); virt="${virt:-none}"           # on bare metal it prints "none" AND exits 1
     cc=$(sys_get net.ipv4.tcp_congestion_control); qd=$(sys_get net.core.default_qdisc)
     rmax=$(sys_get net.ipv4.tcp_rmem | awk '{ print $3 }')
     ct=$(sys_get net.netfilter.nf_conntrack_max); cm=$(sys_get net.netfilter.nf_conntrack_count)
@@ -3137,14 +3528,23 @@ assist_recommended() {    # what the last Bench Tests asked for (newest first, o
         while IFS='|' read -r id why; do [[ -n "$id" ]] && printf "%s; " "$(assist_label "$id")"; done < "$f"; echo ""
     done
 }
-quick_plan() {
-    local pl=""
-    pl+=$(sysctl_row "congestion control" net.ipv4.tcp_congestion_control bbr)$'\n'
-    [[ "$(sys_get net.ipv4.tcp_congestion_control)" == bbr ]] || bbr_available || pl=$(echo "$pl" | sed '/congestion control/d')
-    sys_has net.core.default_qdisc && pl+=$(sysctl_row "queue discipline" net.core.default_qdisc fq)$'\n'
-    pl+=$(sysctl_row "TCP receive limit" net.core.rmem_max 33554432 raise)$'\n'
+quick_plan() {    # every change Quick Optimize makes, as a table - nothing is applied that is not listed here
+    local pl="" dev nic sq fq=""
+    if [[ "$(sys_get net.ipv4.tcp_congestion_control)" == bbr ]] || bbr_available; then
+        fq=fq; pl+=$(sysctl_row "congestion control" net.ipv4.tcp_congestion_control bbr)$'\n'
+        sys_has net.core.default_qdisc && pl+=$(sysctl_row "queue discipline (default)" net.core.default_qdisc fq)$'\n'
+    fi
+    pl+=$(sysctl_row "TCP socket limit (rx)" net.core.rmem_max 33554432 raise)$'\n'
+    pl+=$(sysctl_row "TCP socket limit (tx)" net.core.wmem_max 33554432 raise)$'\n'
+    pl+=$(sysctl_row_tcpmem "TCP receive window max" net.ipv4.tcp_rmem 33554432)$'\n'
+    pl+=$(sysctl_row_tcpmem "TCP send window max" net.ipv4.tcp_wmem 33554432)$'\n'
     pl+=$(limits_plan)$'\n'
-    local dev; dev=$(nic_default_dev); [[ -n "$dev" ]] && pl+=$(nic_plan "$dev")$'\n'
+    dev=$(nic_default_dev)
+    if [[ -n "$dev" ]]; then
+        nic=$(nic_plan "$dev" "$fq"); pl+="$nic"$'\n'
+        [[ "$nic" == *"spread RX"* ]] && pl+=$(sysctl_row "RPS flow table" net.core.rps_sock_flow_entries 32768 raise)$'\n'
+    fi
+    sq=$(softnet_stat | awk '{ print $2 }'); [[ "$sq" =~ ^[0-9]+$ ]] && (( sq > 0 )) && pl+=$(sysctl_row "NAPI budget (CPU squeezed)" net.core.netdev_budget 600 raise)$'\n'
     echo "$pl" | sed '/^$/d'
 }
 assist_quick() {
@@ -3154,21 +3554,24 @@ assist_quick() {
     printf "   ${GR}%-26s %-22s    %s${NC}\n" "setting" "now" "proposed"; echo "$plan"
     echo -e "\n  ${GR}Not included (they need a measurement first): MTU per tunnel, DNS resolver, tunnel profiles - see the menu.${NC}"
     confirm "Apply all of this?" y || return 1
-    local dev; dev=$(nic_default_dev)
-    bbr_available && { tune_sysctl net.core.default_qdisc fq; tune_sysctl net.ipv4.tcp_congestion_control bbr; grep -q tcp_bbr "$MODLOAD_FILE" 2> /dev/null || { mkdir -p "$(dirname "$MODLOAD_FILE")"; echo tcp_bbr > "$MODLOAD_FILE"; }; [[ -n "$dev" ]] && nic_set_qdisc "$dev"; }
+    local dev; dev=$(nic_default_dev); tune_count_reset
+    if bbr_available; then
+        tune_sysctl net.core.default_qdisc fq; tune_sysctl net.ipv4.tcp_congestion_control bbr
+        grep -q tcp_bbr "$MODLOAD_FILE" 2> /dev/null || { mkdir -p "$(dirname "$MODLOAD_FILE")"; echo tcp_bbr > "$MODLOAD_FILE"; }
+    fi
     tune_raise net.core.rmem_max 33554432; tune_raise net.core.wmem_max 33554432
-    local rmax; rmax=$(sys_get net.ipv4.tcp_rmem | awk '{ print $3 }'); [[ "$rmax" =~ ^[0-9]+$ ]] && (( rmax < 33554432 )) && { tune_sysctl net.ipv4.tcp_rmem "4096 131072 33554432"; tune_sysctl net.ipv4.tcp_wmem "4096 65536 33554432"; }
+    tune_raise_tcpmem net.ipv4.tcp_rmem 33554432; tune_raise_tcpmem net.ipv4.tcp_wmem 33554432
     limits_apply
     [[ -n "$dev" ]] && nic_apply "$dev"
-    tune_hist quick "Quick Optimize applied"
-    echo -e "\n  ${G}Applied.${NC} ${GR}Run the Bench Test on a tunnel to see the effect; everything can be undone in Status & revert.${NC}"
+    (( TUNE_OK > 0 )) && tune_hist quick "Quick Optimize applied"
+    tune_done && echo -e "  ${GR}Run the Bench Test on a tunnel to see the effect; everything can be undone in Status & revert.${NC}"
 }
 assist_status() {
     echo -e "\n  ${B}${W}Status & revert${NC}\n"
-    local ns nn nd np nm f
+    local ns nn nd np nm
     ns=$(grep -c . "$TUNE_DIR/sysctl.conf" 2> /dev/null); nn=$(grep -c . "$TUNE_DIR/nic.conf" 2> /dev/null)
     nd=0; [[ -s "$TUNE_DIR/dns.conf" ]] && nd=1
-    np=0; for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && [[ -n "$(. "$f" 2> /dev/null; echo "$P_PROFILE$P_TUNE_MTU")" ]] && np=$((np + 1)); done
+    np=$(grep -lsE "$TUNE_CFG_RE" "$PORTS_DIR"/* 2> /dev/null | wc -l)
     nm=$(grep -c . "$TUNE_DIR/mtu.devs" 2> /dev/null)
     echo -e "   kernel settings changed ..... ${W}${ns:-0}${NC}"
     echo -e "   network card settings ....... ${W}${nn:-0}${NC}"
@@ -3180,25 +3583,28 @@ assist_status() {
         tail -n 12 "$TUNE_DIR/history.log" | while IFS='|' read -r ts area what; do printf "   ${GR}%s${NC}  %-8s %s\n" "$(date -d "@$ts" '+%m-%d %H:%M' 2> /dev/null)" "$area" "$what"; done
     else echo -e "   ${GR}none${NC}"; fi
 }
+tune_routes_flush() { local fam; for fam in -4 -6; do ip $fam route flush proto "$PFM_ROUTE_PROTO" 2> /dev/null; done; return 0; }      # every route the assistant ever made carries this protocol number
 tune_revert_all() {    # tune_revert_all [quiet]
-    local q="${1:-}" f dev n
+    local q="${1:-}" f dev n port m d dp
     n=$(tune_sysctl_revert); [[ -z "$q" ]] && echo -e "   kernel settings restored: $n"
     n=$(nic_revert); [[ -z "$q" ]] && echo -e "   network card settings restored: $n"
     n=$(dns_revert); [[ -z "$q" ]] && echo -e "   DNS restored: $n"
     if [[ -s "$TUNE_DIR/mtu.devs" ]]; then while IFS='=' read -r dev _; do [[ -n "$dev" ]] && reset_mtu "$dev"; done < "$TUNE_DIR/mtu.devs"; : > "$TUNE_DIR/mtu.devs"; fi
     for f in "$PORTS_DIR"/*; do
         [[ -f "$f" ]] || continue
-        local port; port=$(basename "$f")
-        if [[ -n "$(. "$f" 2> /dev/null; echo "$P_PROFILE$P_TUNE_MTU")" ]]; then
-            local P_METHOD="" P_DEST="" P_DPORT="$port" P_PROFILE="" P_TUNE_MTU=""; source "$f"
-            port_unset "$port" P_PROFILE; port_unset "$port" P_TUNE_MTU
-            case "$P_METHOD" in
-                realm) create_realm_service "$port" "$P_DEST" "$P_DPORT" 0 > /dev/null 2>&1; start_realm_service "$port" ;;
+        grep -qsE "$TUNE_CFG_RE" "$f" || continue            # only tunnels that really carry a profile / MTU are touched (the others keep running undisturbed)
+        port="${f##*/}"; m=$(port_get "$port" P_METHOD); d=$(port_get "$port" P_DEST); dp=$(port_get "$port" P_DPORT)
+        local had_profile=0; grep -qs '^P_PROFILE="\?[^" ]' "$f" && had_profile=1
+        port_unset "$port" P_PROFILE; port_unset "$port" P_TUNE_MTU
+        if (( had_profile )) && [[ "$(port_get "$port" P_BLOCKED)" != 1 ]]; then       # a blocked tunnel must not be started by a revert
+            case "${m:-iptables}" in
+                realm) create_realm_service "$port" "$d" "${dp:-$port}" 0 > /dev/null 2>&1; start_realm_service "$port" ;;
                 haproxy) rebuild_haproxy_cfg > /dev/null 2>&1 ;;
             esac
-            tune_apply_tunnel "$port"
         fi
+        tune_apply_tunnel "$port" force
     done
+    tune_routes_flush; rm -rf "$TUNE_DIR/ipcache"; rm -f "$TUNE_DIR"/heal.* "$TUNE_DIR/routes.stamp"
     [[ -z "$q" ]] && echo -e "   tunnel profiles / pinned MTUs cleared"
     tune_hist revert "all PFM tuning reverted"
     return 0
@@ -3211,27 +3617,27 @@ tune_needs_heal() {    # 0 = this tunnel has tuning (profile / pinned MTU) whose
     [[ -n "$P_PROFILE$P_TUNE_MTU" ]] || return 1
     ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || return 1
     is_ipv6 "$ip" && { fam="-6"; plen=128; }
+    [[ "$(tune_route_get "$ip")" == local* ]] && return 1                 # an address of this server: there is no route to tune
     attrs=$(tune_dest_attrs "$ip")
     # a route that is not ours in the way means we never could: that is not "disappeared"
     if [[ -n "$attrs" && -z "$(ip $fam route show exact "$ip/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null)" && -z "$(ip $fam route show exact "$ip/$plen" 2> /dev/null)" ]]; then return 0; fi
     if [[ "$P_METHOD" == iptables && "$P_TUNE_MTU" =~ ^[0-9]+$ ]]; then
         cmd=$(ipt "$P_DEST")
-        $cmd -t mangle -S FORWARD 2> /dev/null | grep -q "pfm_mss_${port}" || return 0
+        $cmd -t mangle -S FORWARD 2> /dev/null | grep -qE "pfm_mss_${port}([ \"]|\$)" || return 0       # exact port: pfm_mss_443 is not pfm_mss_4430
     fi
     return 1
 }
 TUNE_REFRESH_GAP="${PFM_TUNE_REFRESH_GAP:-240}"
 tune_routes_refresh() {    # a host route copies the next hop / source address of the route it shadows; a DHCP renewal or a failover makes the copy stale
-    local stamp="$TUNE_DIR/routes.stamp" now last f ip done_ips=" "          # -> rebuild them from the routing table as it is now, at most every few minutes
+    local stamp="$TUNE_DIR/routes.stamp" now last ip done_ips=" " port d m prof pmtu          # -> rebuild them from the routing table as it is now, at most every few minutes
     now=$(date +%s); last=$(cat "$stamp" 2> /dev/null); [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= TUNE_REFRESH_GAP )) || return 0
     echo "$now" > "$stamp"
-    for f in "$PORTS_DIR"/*; do
-        [[ -f "$f" ]] || continue
-        grep -qE '^P_(PROFILE|TUNE_MTU)=.' "$f" || continue
-        ip=$(tune_dest_ip "$(P_DEST=""; . "$f" 2> /dev/null; echo "$P_DEST")"); [[ -n "$ip" && "$done_ips" != *" $ip "* ]] || continue
+    while IFS='|' read -r port d m prof pmtu _; do
+        [[ -n "$prof$pmtu" ]] || continue
+        ip=$(tune_dest_ip "$d"); [[ -n "$ip" && "$done_ips" != *" $ip "* ]] || continue
         done_ips+="$ip "; tune_apply_dest "$ip"
-    done
+    done < <(tune_port_table)
     # routes of ours that no tuned tunnel points at any more (a hostname that moved to another address, a port file edited by hand)
     local fam r
     for fam in -4 -6; do
@@ -3243,14 +3649,22 @@ tune_routes_refresh() {    # a host route copies the next hop / source address o
     return 0
 }
 tune_heal() {    # from `pfm sync` (every 5 minutes): whatever lost its setting gets it back
-    local d f port
+    local d f port now last stamp
     d=$(tune_sysctl_drift); if [[ -n "$d" ]]; then tune_sysctl_restore; log "HEAL sysctl re-applied: $(echo $d)"; fi
     if nic_drift; then nic_restore; log "HEAL network card settings re-applied"; fi
     dns_heal
-    for f in "$PORTS_DIR"/*; do
-        [[ -f "$f" ]] || continue; port=$(basename "$f")
-        tune_needs_heal "$port" && { tune_apply_tunnel "$port"; log "HEAL tuning of $port (route / MSS rule had disappeared)"; }
-    done
+    if tune_any_config; then
+        now=$(date +%s)
+        for f in "$PORTS_DIR"/*; do
+            [[ -f "$f" ]] || continue; port="${f##*/}"; stamp="$TUNE_DIR/heal.$port"
+            tune_needs_heal "$port" || { rm -f "$stamp"; continue; }
+            # a repair that did not stick (container, no xt_TCPMSS ...) is tried again after half an hour, not at every sync
+            if [[ -r "$stamp" ]]; then last=$(cat "$stamp" 2> /dev/null); [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 1800 )) && continue; fi
+            tune_apply_tunnel "$port" force
+            if tune_needs_heal "$port"; then echo "$now" > "$stamp"; log "HEAL tuning of $port could not be restored (route / MSS rule); next try in 30 min"
+            else rm -f "$stamp"; log "HEAL tuning of $port (route / MSS rule had disappeared)"; fi
+        done
+    fi
     tune_routes_refresh
     return 0
 }
@@ -3279,7 +3693,9 @@ assist_pick_tunnel() {    # prints the chosen port (or nothing)
 assist_tune_menu() {    # assist_tune_menu [port]
     local port="${1:-}" c
     if [[ -z "$port" ]]; then header; echo -e "  ${B}${W}Tune a tunnel${NC}\n"; port=$(assist_pick_tunnel) || { pause; return; }; [[ -n "$port" ]] || return; fi
-    header; echo -e "  ${B}${W}Tune :$port${NC}  ${GR}what do you use this tunnel for?${NC}\n"
+    header
+    if [[ "$(port_get "$port" P_METHOD)" != realm && "$(port_get "$port" P_METHOD)" != haproxy ]]; then assist_profile_set "$port" balanced; pause; return; fi      # kernel NAT: explains what applies instead
+    echo -e "  ${B}${W}Tune :$port${NC}  ${GR}what do you use this tunnel for?${NC}\n"
     local cur; cur=$(port_profile "$port"); cur="${cur:-balanced}"
     local k lbl what i=0
     for k in bandwidth gaming balanced multiuser; do
@@ -3287,7 +3703,7 @@ assist_tune_menu() {    # assist_tune_menu [port]
         printf "  ${W}%d)${NC} %-16s ${GR}%s${NC}%s\n" "$i" "$lbl" "$what" "$([[ "$k" == "$cur" ]] && echo "  ${G}<- active${NC}")"
     done
     echo -e "  ${W}0)${NC} Back"
-    echo -ne "\n  ${C}Select:${NC} "; read -r c
+    echo -ne "\n  ${C}Select:${NC} "; read -r c || return 0
     case "$c" in 1) assist_profile_set "$port" bandwidth ;; 2) assist_profile_set "$port" gaming ;; 3) assist_profile_set "$port" balanced ;; 4) assist_profile_set "$port" multiuser ;; *) return ;; esac
     pause
 }
@@ -3598,10 +4014,8 @@ ver_notes() {    # release notes of one tag (python3 or jq needed to unpack them
 
 # ── switching ──
 assist_has_changes() {    # did the Optimization Assistant change anything an older version could not look after?
-    local f
     [[ -s "$TUNE_DIR/sysctl.conf" || -s "$TUNE_DIR/nic.conf" || -s "$TUNE_DIR/dns.conf" || -s "$TUNE_DIR/mtu.devs" ]] && return 0
-    for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && grep -qE '^P_(PROFILE|TUNE_MTU)=.' "$f" && return 0; done
-    return 1
+    tune_any_config
 }
 versions_verify() {    # one block per broken tunnel; prints nothing when all work. Returns the number of broken tunnels
     local f port probs bad=0
@@ -4048,6 +4462,10 @@ menu_tunnel_detail() {
                 sync_port_usage "$port"
                 remove_rules "$port"
                 sed -i "s|P_DEST=\"$P_DEST\"|P_DEST=\"$newdest\"|" "$PORTS_DIR/$port"
+                if grep -q '^P_TUNE_MTU=' "$PORTS_DIR/$port"; then       # measured for the path to the OLD destination
+                    port_unset "$port" P_TUNE_MTU
+                    echo -e "  ${Y}The MTU pinned for the old destination was removed - run MTU auto-tune (Optimization Assistant) for the new one.${NC}"
+                fi
                 source "$PORTS_DIR/$port"
                 apply_rules "$port" "$newdest" "$P_METHOD" "$P_DPORT"
                 [[ "$P_BLOCKED" == "1" ]] && block_port "$port"
@@ -4338,6 +4756,7 @@ menu_reset() {
     [[ "$c" != "YES" ]] && return
     for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && remove_rules "$(basename "$f")"; done
     rm -f "$PORTS_DIR"/* "$USAGE_DIR"/*; rebuild_haproxy_cfg 2>/dev/null
+    tune_routes_flush; [[ -f "$TUNE_DIR/mss.ports" ]] && : > "$TUNE_DIR/mss.ports"      # the routes of the assistant (they were recomputed from files that still existed a moment ago)
     echo -e "  ${G}All tunnels deleted${NC}"; log "Reset"; echo -ne "  ${GR}Enter...${NC}"; read -r
 }
 
@@ -4371,7 +4790,7 @@ cmd_uninstall() {
     [[ "$c" != "YES" ]] && return
     for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && remove_rules "$(basename "$f")"; done
     cleanup_old; remove_all_mtu
-    tune_sysctl_revert > /dev/null; nic_revert > /dev/null; dns_revert > /dev/null     # give the system back its own settings
+    tune_sysctl_revert > /dev/null; nic_revert > /dev/null; dns_revert > /dev/null; tune_routes_flush     # give the system back its own settings
     for svc in /etc/systemd/system/pfm-realm-*.service; do
         [[ -f "$svc" ]] && { local sn=$(basename "$svc" .service); systemctl stop "$sn" 2>/dev/null; systemctl disable "$sn" 2>/dev/null; rm -f "$svc"; }
     done
@@ -4398,9 +4817,9 @@ usage() {
   ${W}PFM uninstall${NC}                    remove PFM and everything it changed
 
   ${W}PFM doctor${NC} [port]                why does a tunnel not work?
-  ${W}PFM bench${NC} <port> [quick|full] [--peer PORT] [--yes] [--mask]
+  ${W}PFM bench${NC} <port> [quick|full] [--peer PORT] [--inet] [--yes] [--mask]
                                   measure a tunnel: latency, loss, MTU, route, speed (report you can screenshot)
-  ${W}PFM bench-server${NC} [port] [client-ip] [minutes]
+  ${W}PFM bench-server${NC} [port] [client-ip] [minutes 1-120]
                                   run on the DESTINATION server: the helper the speed test talks to
   ${W}PFM optimize${NC} [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]
                                   Optimization Assistant
