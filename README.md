@@ -115,17 +115,18 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
 ```
   PFM BENCH TEST  PFM v2.0 · 2026-10-18 21:40 · full · 178s
   ────────────────────────────────────────────────────────────────────────────
-  Tunnel  :8443 → 203.0.xxx.xx:443   engine realm · profile balanced · owner ali
+  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced · owner ali
   Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel 5.15.0-125-generic
-  Path    eth0 (veth, MTU 1500) · src 198.51.xxx.xx · cc cubic · qdisc pfifo_fast
+  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc pfifo_fast
   ────────────────────────────────────────────────────────────────────────────
-  OVERALL  █████████████████░░░  86/100  Grade B
+  OVERALL  ████████████████░░░░  83/100  Grade B
+  covers the server → destination leg only
   Use: Gaming OK · Streaming/Download GREAT · Calls GREAT · Daily GREAT
   ────────────────────────────────────────────────────────────────────────────
   QUALITY (this server → destination)
    Latency      avg 61.3 ms (min 58.9 / p95 69.8 / max 143.2)      ● EXCELLENT
    Jitter       4.8 ms avg change between packets                  ● EXCELLENT
-   Packet loss  0.33% (1/300 lost, longest gap 1)                  ● GOOD
+   Packet loss  0.33% (1/300 lost, longest gap 1) - isolated       ● GOOD
    Stability    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▁▁▁▁▁▁▁▁▁▁▁▁           1 spike
    TCP connect  10/10 ok, handshake 60.5 ms, MSS 1448              
    MTU          path 1420 / interface 1500, TCP MSS 1380           ● GOOD
@@ -134,18 +135,20 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
    Download     412.6 Mbit/s (4 streams)  ·  58.2 Mbit/s (1 stream) ● EXCELLENT
    Upload       377.9 Mbit/s (4 streams)  ·  retransmits 88       
    UDP 1 Mbit/s loss 0.12%  jitter 2.1 ms (200-byte packets)       
-   Under load   +47 ms (idle 61, down 108, up 84 ms)               ● GOOD
+   Under load   +61 ms (worst ping: idle 70, down 131, up 97 ms)   ● FAIR
    Engine       realm = 96% of direct speed, engine CPU 38%, busiest core 41% 
    Live now     down 3.1 / up 0.4 Mbit/s, 9 connections            
   ────────────────────────────────────────────────────────────────────────────
   FINDINGS
-   ✓ No meaningful packet loss (0.33%).
    ! Path MTU is 1420 but eth0 uses 1500: oversize packets get fragmented
      or need an extra round trip.
-   i Latency rises by +47 ms under load - acceptable.
    ! One connection reaches only 58.2 Mbit/s while 4 together reach 412.6
      Mbit/s: single downloads are held back by loss or too-small TCP
      windows.
+   i 1 of 300 probes got no answer (0.33%). That is too few to call it a
+     pattern - a rate-limited ping or a single drop looks the same. The
+     Full test (60 s) settles it.
+   i Latency rises by +61 ms under load - acceptable.
    ✓ The realm engine adds almost nothing (96% of direct speed).
    ✓ UDP stream is clean (loss 0.12%, jitter 2.1 ms).
   ────────────────────────────────────────────────────────────────────────────
@@ -155,7 +158,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
    3) Enable BBR + fq            BBR fills the pipe with a single connection
   After applying, run this test again - the report shows what changed.
 
-  PFM BENCH TEST - details  :8443 → 203.0.xxx.xx:443
+  PFM BENCH TEST - details  :8443 → 203.0.113.45:443
   ────────────────────────────────────────────────────────────────────────────
   ROUTE (MTR from this server, 10 probes per hop)
    hop  host                                loss%   avg ms     best    worst   stdev
@@ -163,7 +166,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
    2    core1.ir-dc.example                   0.0      1.3      1.1      2.9     0.5
    3    ae3-12.tehran.example.net             0.0      9.6      8.9     14.2     1.4
    4    ffm-b4.example.net                    0.0     57.7     56.9     69.0     3.2
-   5    203.0.xxx.xx                          0.0     61.0     58.9     72.4     3.6
+   5    203.0.113.45                          0.0     61.0     58.9     72.4     3.6
    Loss on middle hops only (not at the last hop) is ICMP rate-limiting.
   ────────────────────────────────────────────────────────────────────────────
   RAW NUMBERS
@@ -380,17 +383,18 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
 ```
   PFM BENCH TEST  PFM v2.0 · 2026-10-18 21:40 · full · 178s
   ────────────────────────────────────────────────────────────────────────────
-  Tunnel  :8443 → 203.0.xxx.xx:443   engine realm · profile balanced · owner ali
+  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced · owner ali
   Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel 5.15.0-125-generic
-  Path    eth0 (veth, MTU 1500) · src 198.51.xxx.xx · cc cubic · qdisc pfifo_fast
+  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc pfifo_fast
   ────────────────────────────────────────────────────────────────────────────
-  OVERALL  █████████████████░░░  86/100  Grade B
+  OVERALL  ████████████████░░░░  83/100  Grade B
+  covers the server → destination leg only
   Use: Gaming OK · Streaming/Download GREAT · Calls GREAT · Daily GREAT
   ────────────────────────────────────────────────────────────────────────────
   QUALITY (this server → destination)
    Latency      avg 61.3 ms (min 58.9 / p95 69.8 / max 143.2)      ● EXCELLENT
    Jitter       4.8 ms avg change between packets                  ● EXCELLENT
-   Packet loss  0.33% (1/300 lost, longest gap 1)                  ● GOOD
+   Packet loss  0.33% (1/300 lost, longest gap 1) - isolated       ● GOOD
    Stability    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▁▁▁▁▁▁▁▁▁▁▁▁           1 spike
    TCP connect  10/10 ok, handshake 60.5 ms, MSS 1448              
    MTU          path 1420 / interface 1500, TCP MSS 1380           ● GOOD
@@ -399,18 +403,20 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
    Download     412.6 Mbit/s (4 streams)  ·  58.2 Mbit/s (1 stream) ● EXCELLENT
    Upload       377.9 Mbit/s (4 streams)  ·  retransmits 88       
    UDP 1 Mbit/s loss 0.12%  jitter 2.1 ms (200-byte packets)       
-   Under load   +47 ms (idle 61, down 108, up 84 ms)               ● GOOD
+   Under load   +61 ms (worst ping: idle 70, down 131, up 97 ms)   ● FAIR
    Engine       realm = 96% of direct speed, engine CPU 38%, busiest core 41% 
    Live now     down 3.1 / up 0.4 Mbit/s, 9 connections            
   ────────────────────────────────────────────────────────────────────────────
   FINDINGS
-   ✓ No meaningful packet loss (0.33%).
    ! Path MTU is 1420 but eth0 uses 1500: oversize packets get fragmented
      or need an extra round trip.
-   i Latency rises by +47 ms under load - acceptable.
    ! One connection reaches only 58.2 Mbit/s while 4 together reach 412.6
      Mbit/s: single downloads are held back by loss or too-small TCP
      windows.
+   i 1 of 300 probes got no answer (0.33%). That is too few to call it a
+     pattern - a rate-limited ping or a single drop looks the same. The
+     Full test (60 s) settles it.
+   i Latency rises by +61 ms under load - acceptable.
    ✓ The realm engine adds almost nothing (96% of direct speed).
    ✓ UDP stream is clean (loss 0.12%, jitter 2.1 ms).
   ────────────────────────────────────────────────────────────────────────────
@@ -420,7 +426,7 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
    3) Enable BBR + fq            BBR fills the pipe with a single connection
   After applying, run this test again - the report shows what changed.
 
-  PFM BENCH TEST - details  :8443 → 203.0.xxx.xx:443
+  PFM BENCH TEST - details  :8443 → 203.0.113.45:443
   ────────────────────────────────────────────────────────────────────────────
   ROUTE (MTR from this server, 10 probes per hop)
    hop  host                                loss%   avg ms     best    worst   stdev
@@ -428,7 +434,7 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
    2    core1.ir-dc.example                   0.0      1.3      1.1      2.9     0.5
    3    ae3-12.tehran.example.net             0.0      9.6      8.9     14.2     1.4
    4    ffm-b4.example.net                    0.0     57.7     56.9     69.0     3.2
-   5    203.0.xxx.xx                          0.0     61.0     58.9     72.4     3.6
+   5    203.0.113.45                          0.0     61.0     58.9     72.4     3.6
    Loss on middle hops only (not at the last hop) is ICMP rate-limiting.
   ────────────────────────────────────────────────────────────────────────────
   RAW NUMBERS
