@@ -3417,7 +3417,9 @@ dns_heal() {    # a DHCP client or cloud-init may rewrite a plain resolv.conf: p
     local want first r; want=$(kv_get "$TUNE_DIR/dns.conf" servers); first=$(awk '/^nameserver/ { print $2; exit }' "$RESOLV_CONF" 2> /dev/null)
     [[ "$first" == "${want%% *}" ]] && return 0
     [[ -L "$RESOLV_CONF" ]] && return 0
-    r=$(dns_query "${want%% *}" github.com); [[ "${r%% *}" == TIMEOUT ]] && { log "HEAL dns skipped: ${want%% *} does not answer (the system's own resolver stays)"; return 0; }
+    if command -v dig > /dev/null 2>&1; then
+        r=$(dns_query "${want%% *}" github.com); [[ "${r%% *}" == TIMEOUT ]] && { log "HEAL dns skipped: ${want%% *} does not answer (the system's own resolver stays)"; return 0; }
+    fi
     dns_apply $want > /dev/null && log "HEAL dns: resolv.conf had been rewritten, restored $want"
 }
 dns_verify() {    # after a change: the new first resolver answers AND the system resolves a name through it
@@ -3629,6 +3631,7 @@ tune_needs_heal() {    # 0 = this tunnel has tuning (profile / pinned MTU) whose
 }
 TUNE_REFRESH_GAP="${PFM_TUNE_REFRESH_GAP:-240}"
 tune_routes_refresh() {    # a host route copies the next hop / source address of the route it shadows; a DHCP renewal or a failover makes the copy stale
+    [[ -d "$TUNE_DIR" ]] || return 0               # the assistant was never used on this server: there is nothing of ours to refresh
     local stamp="$TUNE_DIR/routes.stamp" now last ip done_ips=" " port d m prof pmtu          # -> rebuild them from the routing table as it is now, at most every few minutes
     now=$(date +%s); last=$(cat "$stamp" 2> /dev/null); [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= TUNE_REFRESH_GAP )) || return 0
