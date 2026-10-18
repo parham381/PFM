@@ -1256,7 +1256,7 @@ cmd_sync() {
     sync_all; check_limits
     [[ "$(systemctl is-system-running 2>/dev/null)" == "stopping" ]] && return
     # one run of the repair work at a time: a slow one (name lookups, a busy machine) must not pile up under the next cron run; it waits, it never skips
-    if command -v flock > /dev/null 2>&1 && exec 9> "$PFM_DIR/.sync.lock" 2> /dev/null; then
+    if command -v flock > /dev/null 2>&1 && { exec 9> "$PFM_DIR/.sync.lock"; } 2> /dev/null; then      # (the braces keep the 2> /dev/null from silencing this process for good)
         flock -w 60 9 || log "sync: the previous run was still busy after 60 s - continuing anyway"
     fi
     heal_rules
