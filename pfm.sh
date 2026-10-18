@@ -180,7 +180,7 @@ SYSCTL_ROOT="${PFM_SYSCTL_ROOT:-/proc/sys}"
 sys_path() { echo "$SYSCTL_ROOT/${1//./\/}"; }
 sys_has() { [[ -e "$(sys_path "$1")" ]]; }
 sys_get() { local p; p=$(sys_path "$1"); [[ -r "$p" ]] && tr '\t' ' ' < "$p" | tr -s ' ' | sed 's/ *$//'; }
-sys_set() { local p; p=$(sys_path "$1"); [[ -e "$p" ]] || return 1; printf '%s\n' "$2" > "$p" 2> /dev/null || return 2; }
+sys_set() { local p; p=$(sys_path "$1"); [[ -e "$p" ]] || return 1; { printf '%s\n' "$2" > "$p"; } 2> /dev/null || return 2; }      # (braces: a refusal must not print bash's own redirection error)
 # @@END helpers@@
 
 # Name of the process that listens on a TCP port ("" = free, or ss is not installed)
@@ -1260,7 +1260,6 @@ cmd_sync() {
         flock -w 60 9 || log "sync: the previous run was still busy after 60 s - continuing anyway"
     fi
     heal_rules
-    tune_heal
     # Health check all realm services + haproxy
     local f
     for f in "$PORTS_DIR"/*; do
@@ -1269,6 +1268,7 @@ cmd_sync() {
     done
     haproxy_health_check
     watch_tunnels
+    tune_heal                          # last: a dead engine is more urgent than a lost route attribute
 }
 
 # Keeps the counters of the previous sync and writes to the log when a tunnel starts or stops
@@ -2611,7 +2611,7 @@ SYSCTL_D_FILE="${PFM_SYSCTL_D_FILE:-/etc/sysctl.d/99-pfm.tune.conf}"
 MODLOAD_FILE="${PFM_MODLOAD_FILE:-/etc/modules-load.d/bbr.conf}"
 PFM_ROUTE_PROTO=77         # routes the assistant creates carry this protocol number, so only they are ever removed
 
-tune_init() { mkdir -p "$TUNE_DIR"; local f; for f in history.log sysctl.orig sysctl.conf nic.conf nic.orig mss.ports; do [[ -e "$TUNE_DIR/$f" ]] || : > "$TUNE_DIR/$f"; done; }
+tune_init() { mkdir -p "$TUNE_DIR"; local f; for f in history.log sysctl.orig sysctl.conf nic.conf nic.orig mss.ports misc.orig; do [[ -e "$TUNE_DIR/$f" ]] || : > "$TUNE_DIR/$f"; done; }
 tune_hist() { tune_init; echo "$(date +%s)|$1|$2" >> "$TUNE_DIR/history.log"; log "TUNE $1: $2"; }
 kv_get() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2> /dev/null; }
 kv_has() { awk -F= -v k="$2" '$1 == k { f = 1 } END { exit !f }' "$1" 2> /dev/null; }
@@ -2626,13 +2626,14 @@ port_unset() { sed -i "/^$2=/d" "$PORTS_DIR/$1" 2> /dev/null; }
 # ── kernel tunables: original value remembered, change persisted, re-applied at boot and by sync ──
 TUNE_OK=0; TUNE_NO=0       # settings really written / refused since tune_count_reset: the closing line must tell the truth
 tune_count_reset() { TUNE_OK=0; TUNE_NO=0; }
-tune_sysctl() {    # tune_sysctl <key> <value> -> 0 applied · 1 not in this kernel · 2 refused (container / read-only)
+tune_sysctl() {    # tune_sysctl <key> <value> -> 0 applied · 1 not in this kernel · 2 refused (container / read-only / no room to record the original)
     local k="$1" v="$2" cur
     sys_has "$k" || return 1
     tune_init; cur=$(sys_get "$k")
-    kv_has "$TUNE_DIR/sysctl.orig" "$k" || kv_set "$TUNE_DIR/sysctl.orig" "$k" "$cur"
+    # the original is recorded FIRST: a change that cannot be undone is not made
+    kv_has "$TUNE_DIR/sysctl.orig" "$k" || kv_set "$TUNE_DIR/sysctl.orig" "$k" "$cur" || { TUNE_NO=$((TUNE_NO + 1)); return 2; }
     if [[ "$cur" != "$v" ]]; then sys_set "$k" "$v" || { TUNE_NO=$((TUNE_NO + 1)); return 2; }; fi
-    kv_set "$TUNE_DIR/sysctl.conf" "$k" "$v"
+    if ! kv_set "$TUNE_DIR/sysctl.conf" "$k" "$v"; then [[ "$cur" != "$v" ]] && sys_set "$k" "$cur"; TUNE_NO=$((TUNE_NO + 1)); return 2; fi
     tune_sysctl_d
     TUNE_OK=$((TUNE_OK + 1))
     return 0
@@ -2662,10 +2663,22 @@ tune_sysctl_d() {    # the same settings for the kernel's own boot-time loader (
         { echo "# Written by the PFM Optimization Assistant. 'pfm optimize' -> Status & revert removes it."; sed 's/=/ = /' "$TUNE_DIR/sysctl.conf"; } > "$t" && chmod 644 "$t" && mv -f "$t" "$SYSCTL_D_FILE" || rm -f "$t"
     else rm -f "$SYSCTL_D_FILE"; fi
 }
-tune_sysctl_restore() { local k v; [[ -s "$TUNE_DIR/sysctl.conf" ]] || return 0; while IFS='=' read -r k v; do [[ -n "$k" ]] && sys_set "$k" "$v" 2> /dev/null; done < "$TUNE_DIR/sysctl.conf"; return 0; }
-tune_sysctl_drift() {    # keys whose live value differs from what the assistant set (somebody ran sysctl -p / a boot script)
+tune_sysctl_wanted() {    # tune_sysctl_wanted <key> <stored value> -> 0 = the live value should be written again.
+    local k="$1" want="$2" live orig lc wc          # A number is only ever RAISED (a higher value an admin chose stays); of tcp_rmem / tcp_wmem only the ceiling is ours;
+    live=$(sys_get "$k"); [[ "$live" == "$want" ]] && return 1       # anything else (congestion control, queue) is put back only when it is back at the value it had before we changed it.
+    if [[ "$want" =~ ^[0-9]+$ && "$live" =~ ^[0-9]+$ ]]; then (( live < want )); return; fi
+    if [[ "$want" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ && "$live" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]]; then lc="${live##* }"; wc="${want##* }"; (( lc < wc )); return; fi
+    orig=$(kv_get "$TUNE_DIR/sysctl.orig" "$k"); [[ -n "$live" && "$live" == "$orig" ]]
+}
+tune_sysctl_write_stored() {    # a multi-field window setting keeps the minimum / default somebody else chose; only its ceiling is ours
+    local k="$1" want="$2" a b c
+    if [[ "$want" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]]; then read -r a b c <<< "$(sys_get "$k")"; [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && want="$a $b ${want##* }"; fi
+    sys_set "$k" "$want"
+}
+tune_sysctl_restore() { local k v; [[ -s "$TUNE_DIR/sysctl.conf" ]] || return 0; while IFS='=' read -r k v; do [[ -n "$k" ]] && tune_sysctl_wanted "$k" "$v" && tune_sysctl_write_stored "$k" "$v"; done < "$TUNE_DIR/sysctl.conf"; return 0; }
+tune_sysctl_drift() {    # keys that lost the setting the assistant made (somebody ran sysctl -p / a boot script reset them) - a value an admin chose on purpose is no drift
     local k v; [[ -s "$TUNE_DIR/sysctl.conf" ]] || return 0
-    while IFS='=' read -r k v; do [[ -n "$k" ]] && [[ "$(sys_get "$k")" != "$v" ]] && echo "$k"; done < "$TUNE_DIR/sysctl.conf"; return 0
+    while IFS='=' read -r k v; do [[ -n "$k" ]] && tune_sysctl_wanted "$k" "$v" && echo "$k"; done < "$TUNE_DIR/sysctl.conf"; return 0
 }
 tune_sysctl_revert() {
     local k v n=0
@@ -2702,7 +2715,7 @@ assist_bbr() {
     echo -e "  ${GR}terminates itself (realm / HAProxy tunnels); iptables-forwarded connections are only NAT-ed.${NC}\n"
     if ! bbr_available; then echo -e "  ${R}BBR is not available here (kernel older than 4.9, or a container without the module).${NC}"; return 1; fi
     if [[ "$cc" == bbr && "$qd" == fq && -z "$swap" ]]; then echo -e "  ${G}Already active.${NC}"; return 0; fi
-    [[ -n "$swap" ]] && echo -e "  ${GR}Also: the queue of $swap is the kernel default ($(nic_root_qdisc "$swap")) - it is switched to fq right away (a custom qdisc is never touched).${NC}\n"
+    [[ -n "$swap" ]] && echo -e "  ${GR}Also: the queue of $swap is the kernel default ($(nic_root_qdisc "$swap")) - it is switched to fq right away if tc allows it (a queue you configured is never touched).${NC}\n"
     confirm "Enable BBR + fq now and keep it after reboot?" y || return 1
     local r; tune_count_reset
     tune_sysctl net.core.default_qdisc fq; r=$?
@@ -2710,7 +2723,7 @@ assist_bbr() {
     tune_sysctl net.ipv4.tcp_congestion_control bbr; r=$?
     if (( r != 0 )); then echo -e "  ${R}Could not switch the congestion control (${r}).${NC}"; return 1; fi
     grep -q tcp_bbr "$MODLOAD_FILE" 2> /dev/null || { mkdir -p "$(dirname "$MODLOAD_FILE")"; echo tcp_bbr > "$MODLOAD_FILE"; }
-    [[ -n "$dev" ]] && nic_set_qdisc "$dev"
+    if [[ -n "$swap" ]]; then nic_set_qdisc "$dev" || echo -e "  ${Y}tc did not accept the new queue for $dev - it keeps its current one (new devices and queues still get fq).${NC}"; fi
     tune_hist cc "BBR + fq enabled (was ${cc:-?}/${qd:-?})"
     echo -e "  ${G}BBR is active${NC} ${GR}($(sys_get net.ipv4.tcp_congestion_control), qdisc $(sys_get net.core.default_qdisc)). New connections use it; existing ones keep their old algorithm.${NC}"
 }
@@ -2735,30 +2748,50 @@ assist_buffers() {    # assist_buffers [rtt_ms] [target Mbit/s]
 }
 
 # ── limits that silently cap busy forwarders ──
-limits_plan() {    # prints the rows that would change
+limits_ct_target() {    # the connection-tracking limit this much RAM deserves
     local mem ct
     mem=$(awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo)
     ct=131072; (( mem >= 1000 )) && ct=262144; (( mem >= 2000 )) && ct=524288; (( mem >= 4000 )) && ct=1048576; (( mem >= 8000 )) && ct=2097152
+    echo "$ct"
+}
+ct_hash_want() {    # prints "<current> <wanted>" when the conntrack hash table is smaller than a quarter of the (new) limit and the module lets us resize it
+    local hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}" cmax hcur ct
+    [[ -w "$hs" ]] || return 0
+    ct=$(limits_ct_target); cmax=$(sys_get net.netfilter.nf_conntrack_max); hcur=$(cat "$hs" 2> /dev/null)
+    [[ "$cmax" =~ ^[0-9]+$ && "$hcur" =~ ^[0-9]+$ ]] || return 0
+    (( cmax < ct )) && cmax=$ct
+    (( hcur < cmax / 4 )) && echo "$hcur $(( cmax / 4 ))"
+    return 0
+}
+limits_plan() {    # prints the rows that would change
+    local ct hw; ct=$(limits_ct_target)
     sysctl_row "connection tracking" net.netfilter.nf_conntrack_max "$ct" raise
+    hw=$(ct_hash_want); [[ -n "$hw" ]] && printf "   %-26s %-22s -> %s\n" "conntrack hash (until reboot)" "${hw% *}" "${hw#* }"
     sysctl_row "listen backlog" net.core.somaxconn 8192 raise
     sysctl_row "SYN backlog" net.ipv4.tcp_max_syn_backlog 8192 raise
     sysctl_row "receive queue per CPU" net.core.netdev_max_backlog 16384 raise
     sysctl_row "open files (system)" fs.file-max 1048576 raise
 }
 limits_apply() {
-    local mem ct
-    mem=$(awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo)
-    ct=131072; (( mem >= 1000 )) && ct=262144; (( mem >= 2000 )) && ct=524288; (( mem >= 4000 )) && ct=1048576; (( mem >= 8000 )) && ct=2097152
+    local ct hw hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}"
+    ct=$(limits_ct_target)
+    hw=$(ct_hash_want)                      # decided BEFORE the limit is raised: the plan and the action see the same numbers
     tune_raise net.netfilter.nf_conntrack_max "$ct"
     tune_raise net.core.somaxconn 8192; tune_raise net.ipv4.tcp_max_syn_backlog 8192
     tune_raise net.core.netdev_max_backlog 16384; tune_raise fs.file-max 1048576
-    # a hash table sized for the larger limit keeps lookups fast (only when both values can be read)
-    local hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}" want cmax hcur
-    if [[ -w "$hs" ]]; then
-        cmax=$(sys_get net.netfilter.nf_conntrack_max); hcur=$(cat "$hs" 2> /dev/null)
-        if [[ "$cmax" =~ ^[0-9]+$ && "$hcur" =~ ^[0-9]+$ ]]; then want=$(( cmax / 4 )); (( hcur < want )) && echo "$want" > "$hs" 2> /dev/null; fi
+    # a hash table sized for the larger limit keeps lookups fast; the original size is remembered so that "revert" can give it back
+    if [[ -n "$hw" ]]; then
+        tune_init; kv_has "$TUNE_DIR/misc.orig" hashsize || kv_set "$TUNE_DIR/misc.orig" hashsize "${hw% *}" || return 0
+        { echo "${hw#* }" > "$hs"; } 2> /dev/null && TUNE_OK=$((TUNE_OK + 1))
     fi
     return 0
+}
+tune_misc_revert() {    # settings that are not sysctl keys (the conntrack hash size); prints how many were put back
+    local n=0 v hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}"
+    v=$(kv_get "$TUNE_DIR/misc.orig" hashsize)
+    [[ "$v" =~ ^[0-9]+$ ]] && [[ -w "$hs" ]] && { echo "$v" > "$hs"; } 2> /dev/null && n=$((n + 1))
+    [[ -f "$TUNE_DIR/misc.orig" ]] && : > "$TUNE_DIR/misc.orig"
+    echo "$n"
 }
 assist_limits() {
     local plan; plan=$(limits_plan)
@@ -2829,14 +2862,18 @@ nic_scan() {    # nic_scan <dev> -> one-line facts
     echo "dev=$dev driver=${drv:-?} speed=$speed rxq=$rxq cpus=$cpus drops=$drops mtu=$(cat "$SYSFS_NET/$dev/mtu" 2> /dev/null) gro=$(nic_feature "$dev" generic-receive-offload) gso=$(nic_feature "$dev" generic-segmentation-offload) tso=$(nic_feature "$dev" tcp-segmentation-offload) lro=$(nic_feature "$dev" large-receive-offload)"
 }
 nic_plan() {    # nic_plan <dev> [fq] -> rows describing what would change ("fq" = BBR is about to be enabled, so the queue is part of the plan too)
-    local dev="$1" want_fq="${2:-}" cpus rxq spec feat f st cur
+    local dev="$1" want_fq="${2:-}" cpus rxq feat f st cur sq    # nic_apply does exactly this and nothing more
     cpus=$(nproc 2> /dev/null || echo 1); rxq=$(nic_rxq "$dev")
     if (( rxq == 1 && cpus > 1 )) && [[ -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]]; then
-        [[ "$(nic_norm_mask "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)")" == 0 ]] && printf "   %-30s %-14s -> %s\n" "$dev: spread RX over CPUs (RPS)" "1 CPU handles all" "$cpus CPUs"
+        if [[ "$(nic_norm_mask "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)")" == 0 ]]; then
+            printf "   %-30s %-14s -> %s\n" "$dev: spread RX over CPUs (RPS)" "1 CPU handles all" "$cpus CPUs"
+            sysctl_row "RPS flow table" net.core.rps_sock_flow_entries 32768 raise
+        fi
     fi
     if [[ -n "$want_fq" ]] || nic_qdisc_wanted; then
         [[ -n "$(nic_qdisc_targets "$dev")" ]] && printf "   %-30s %-14s -> %s\n" "$dev: queue (live, no reboot)" "$(nic_root_qdisc "$dev")" "fq"
     fi
+    sq=$(softnet_stat | awk '{ print $2 }'); [[ "$sq" =~ ^[0-9]+$ ]] && (( sq > 0 )) && sysctl_row "NAPI budget (CPU squeezed)" net.core.netdev_budget 600 raise
     command -v ethtool > /dev/null 2>&1 || return 0
     while read -r feat f st; do
         nic_feature_fixed "$dev" "$feat" && continue
@@ -2845,38 +2882,41 @@ nic_plan() {    # nic_plan <dev> [fq] -> rows describing what would change ("fq"
     done < <(nic_wanted_features)
     return 0
 }
-nic_apply() {    # nic_apply <dev> [rings]
-    local dev="$1" rings="${2:-0}" cpus rxq q mask feat f st cur okq=0 sq
+nic_apply() {    # nic_apply <dev> [1|only_rings]: exactly what nic_plan lists; 1 = the ring buffers as well, only_rings = nothing but those
+    local dev="$1" mode="${2:-0}" cpus rxq q mask feat f st cur okq=0 sq
     cpus=$(nproc 2> /dev/null || echo 1); rxq=$(nic_rxq "$dev"); tune_init
-    if (( rxq == 1 && cpus > 1 )) && [[ -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]]; then
-        mask=$(cpu_mask_hex "$cpus")
-        for q in "$SYSFS_NET/$dev"/queues/rx-*; do
-            kv_has "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" || kv_set "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" "$(cat "$q/rps_cpus" 2> /dev/null)"
-            if echo "$mask" > "$q/rps_cpus" 2> /dev/null; then okq=1; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); continue; fi
-            echo $(( 32768 / rxq )) > "$q/rps_flow_cnt" 2> /dev/null
-        done
-        if (( okq )); then tune_sysctl net.core.rps_sock_flow_entries 32768; kv_set "$TUNE_DIR/nic.conf" "rps:$dev" "$mask"; fi
+    if [[ "$mode" != only_rings ]]; then
+        if (( rxq == 1 && cpus > 1 )) && [[ -e "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" ]] && [[ "$(nic_norm_mask "$(cat "$SYSFS_NET/$dev/queues/rx-0/rps_cpus" 2> /dev/null)")" == 0 ]]; then
+            mask=$(cpu_mask_hex "$cpus")             # (a card that already spreads its work, or has a mask somebody chose, is left alone)
+            for q in "$SYSFS_NET/$dev"/queues/rx-*; do
+                kv_has "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" || kv_set "$TUNE_DIR/nic.orig" "rps:$dev:${q##*/}" "$(cat "$q/rps_cpus" 2> /dev/null)"
+                kv_has "$TUNE_DIR/nic.orig" "rpsflow:$dev:${q##*/}" || kv_set "$TUNE_DIR/nic.orig" "rpsflow:$dev:${q##*/}" "$(cat "$q/rps_flow_cnt" 2> /dev/null)"
+                if { echo "$mask" > "$q/rps_cpus"; } 2> /dev/null; then okq=1; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); continue; fi
+                { echo $(( 32768 / rxq )) > "$q/rps_flow_cnt"; } 2> /dev/null
+            done
+            if (( okq )); then tune_raise net.core.rps_sock_flow_entries 32768; kv_set "$TUNE_DIR/nic.conf" "rps:$dev" "$mask"; fi
+        fi
+        if nic_qdisc_wanted && [[ -n "$(nic_qdisc_targets "$dev")" ]]; then if nic_set_qdisc "$dev"; then TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi; fi
+        if command -v ethtool > /dev/null 2>&1; then
+            while read -r feat f st; do
+                nic_feature_fixed "$dev" "$feat" && continue
+                cur=$(nic_feature "$dev" "$feat"); [[ -n "$cur" && "$cur" != "$st" ]] || continue
+                kv_has "$TUNE_DIR/nic.orig" "off:$dev:$f" || kv_set "$TUNE_DIR/nic.orig" "off:$dev:$f" "$cur"
+                if ethtool -K "$dev" "$f" "$st" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "off:$dev:$f" "$st"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
+            done < <(nic_wanted_features)
+        fi
+        sq=$(softnet_stat | awk '{ print $2 }')
+        [[ "$sq" =~ ^[0-9]+$ && "$sq" -gt 0 ]] && tune_raise net.core.netdev_budget 600
     fi
-    if nic_qdisc_wanted && [[ -n "$(nic_qdisc_targets "$dev")" ]]; then if nic_set_qdisc "$dev"; then TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi; fi
-    if command -v ethtool > /dev/null 2>&1; then
-        while read -r feat f st; do
-            nic_feature_fixed "$dev" "$feat" && continue
-            cur=$(nic_feature "$dev" "$feat"); [[ -n "$cur" && "$cur" != "$st" ]] || continue
-            kv_has "$TUNE_DIR/nic.orig" "off:$dev:$f" || kv_set "$TUNE_DIR/nic.orig" "off:$dev:$f" "$cur"
-            if ethtool -K "$dev" "$f" "$st" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "off:$dev:$f" "$st"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
-        done < <(nic_wanted_features)
-        if [[ "$rings" == 1 ]]; then
-            local rmax tmax rcur tcur rn tn
-            read -r rmax tmax rcur tcur <<< "$(nic_ring "$dev")"
-            if (( rmax > rcur || tmax > tcur )); then
-                rn=$(( rmax > rcur ? rmax : rcur )); tn=$(( tmax > tcur ? tmax : tcur ))        # a dimension the driver cannot raise keeps its value
-                kv_has "$TUNE_DIR/nic.orig" "ring:$dev" || kv_set "$TUNE_DIR/nic.orig" "ring:$dev" "$rcur $tcur"
-                if ethtool -G "$dev" rx "$rn" tx "$tn" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "ring:$dev" "$rn $tn"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
-            fi
+    if [[ "$mode" == 1 || "$mode" == only_rings ]] && command -v ethtool > /dev/null 2>&1; then
+        local rmax tmax rcur tcur rn tn
+        read -r rmax tmax rcur tcur <<< "$(nic_ring "$dev")"
+        if (( rmax > rcur || tmax > tcur )); then
+            rn=$(( rmax > rcur ? rmax : rcur )); tn=$(( tmax > tcur ? tmax : tcur ))        # a dimension the driver cannot raise keeps its value
+            kv_has "$TUNE_DIR/nic.orig" "ring:$dev" || kv_set "$TUNE_DIR/nic.orig" "ring:$dev" "$rcur $tcur"
+            if ethtool -G "$dev" rx "$rn" tx "$tn" > /dev/null 2>&1; then kv_set "$TUNE_DIR/nic.conf" "ring:$dev" "$rn $tn"; TUNE_OK=$((TUNE_OK + 1)); else TUNE_NO=$((TUNE_NO + 1)); fi
         fi
     fi
-    sq=$(softnet_stat | awk '{ print $2 }')
-    [[ "$sq" =~ ^[0-9]+$ && "$sq" -gt 0 ]] && tune_raise net.core.netdev_budget 600
     return 0
 }
 nic_restore() {    # boot / heal: put the stored card settings back (only what is not already in place: a driver may blink the link on any set)
@@ -2924,7 +2964,8 @@ nic_revert() {
         kind="${k%%:*}"; dev="${k#*:}"; what="${dev#*:}"; dev="${dev%%:*}"
         [[ -d "$SYSFS_NET/$dev" ]] || continue
         case "$kind" in
-            rps)  q="$what"; echo "$v" > "$SYSFS_NET/$dev/queues/$q/rps_cpus" 2> /dev/null && n=$((n + 1)) ;;
+            rps)  q="$what"; { echo "$v" > "$SYSFS_NET/$dev/queues/$q/rps_cpus"; } 2> /dev/null && n=$((n + 1)) ;;
+            rpsflow) q="$what"; { echo "$v" > "$SYSFS_NET/$dev/queues/$q/rps_flow_cnt"; } 2> /dev/null ;;
             off)  ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 && n=$((n + 1)) ;;
             ring) ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 && n=$((n + 1)) ;;
             qdisc) read -r qk qv <<< "$v"; [[ -n "$qv" ]] || { qv="$qk"; qk=root; }           # "<root|mq> <qdisc>"; only a queue that still is OUR fq is put back
@@ -2947,7 +2988,7 @@ assist_nic() {
         echo -e "  ${W}$d${NC} ${GR}driver $(kvget "$info" driver), $(kvget "$info" speed) Mbit/s, MTU $(kvget "$info" mtu), $(kvget "$info" rxq) RX queue(s), $(nproc) CPU(s), RX drops $(kvget "$info" drops)${NC}"
         plan+=$(nic_plan "$d")$'\n'
     done
-    plan=$(echo "$plan" | sed '/^$/d')
+    plan=$(echo "$plan" | sed '/^$/d' | awk '!s[$0]++')
     echo ""
     if [[ -z "$plan" ]]; then echo -e "  ${G}Nothing to change: offloads are sane and the card already spreads its work.${NC}"
     else printf "   ${GR}%-30s %-14s    %s${NC}\n" "change" "now" "proposed"; echo "$plan"; echo ""
@@ -2960,7 +3001,7 @@ assist_nic() {
     fi
     local dd; for d in $devs; do dd=$(kvget "$(nic_scan "$d")" drops); if [[ "$dd" =~ ^[0-9]+$ ]] && (( dd > 0 )) && command -v ethtool > /dev/null 2>&1; then
         echo -e "\n  ${Y}$d has dropped $dd received packets since boot.${NC} ${GR}Larger ring buffers absorb bursts (may blink the link for a moment).${NC}"
-        confirm "Maximise the ring buffers of $d?" n && { tune_count_reset; nic_apply "$d" 1; (( TUNE_OK > 0 )) && tune_hist nic "ring buffers of $d maximised"; tune_done; }
+        confirm "Maximise the ring buffers of $d?" n && { tune_count_reset; nic_apply "$d" only_rings; (( TUNE_OK > 0 )) && tune_hist nic "ring buffers of $d maximised"; tune_done; }
     fi; done
     return 0
 }
@@ -2999,15 +3040,15 @@ profile_realm_unit() {    # a raised priority is refused inside containers, so o
 port_profile() { ( P_PROFILE=""; source "$PORTS_DIR/$1" 2> /dev/null; echo "${P_PROFILE:-}" ); }
 port_get() {    # port_get <port> <P_KEY> -> its value, read without starting a process per line
     local k v
-    while IFS='=' read -r k v; do [[ "$k" == "$2" ]] && { v="${v#\"}"; echo "${v%\"}"; return 0; }; done < "$PORTS_DIR/$1" 2> /dev/null
+    { while IFS='=' read -r k v; do [[ "$k" == "$2" ]] && { v="${v#\"}"; echo "${v%\"}"; return 0; }; done < "$PORTS_DIR/$1"; } 2> /dev/null
     return 1
 }
 TUNE_CFG_RE='^P_(PROFILE|TUNE_MTU)="?[^" ]'      # a tunnel line that really carries a profile / pinned MTU
 tune_any_config() { grep -qsE "$TUNE_CFG_RE" "$PORTS_DIR"/* 2> /dev/null; }
 tune_port_table() {    # one line per tunnel, read in ONE pass over the port files: port|destination|method|profile|pinned MTU|blocked
-    local f first=""         # (restore / sync ask for every tunnel; a process per file made that quadratic)
-    for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && { first=1; break; }; done
-    [[ -n "$first" ]] || return 0
+    local f files=()     # (restore / sync ask for every tunnel; a process per file made that quadratic. Only regular files are handed to awk: a stray directory would stop it.)
+    for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && files+=("$f"); done
+    (( ${#files[@]} )) || return 0
     awk '
         function flush() { if (port != "") print port "|" d "|" m "|" p "|" t "|" b }
         FNR == 1 { flush(); port = FILENAME; sub(/^.*\//, "", port); d = ""; m = "iptables"; p = ""; t = ""; b = 0 }
@@ -3017,7 +3058,12 @@ tune_port_table() {    # one line per tunnel, read in ONE pass over the port fil
             else if (k == "P_TUNE_MTU") t = v; else if (k == "P_BLOCKED") b = v
         }
         END { flush() }
-    ' "$PORTS_DIR"/* 2> /dev/null
+    ' "${files[@]}" 2> /dev/null
+}
+tune_port_tuned() {    # does this tunnel carry a profile / pinned MTU? (read without starting a process)
+    local l
+    while IFS= read -r l; do [[ "$l" =~ $TUNE_CFG_RE ]] && return 0; done < "$PORTS_DIR/$1" 2> /dev/null
+    return 1
 }
 
 tune_dest_ip() {    # destination of a tunnel as an IP. A name is looked up at most once a minute (cache in $TUNE_DIR/ipcache) and never for longer than 3 s:
@@ -3025,12 +3071,13 @@ tune_dest_ip() {    # destination of a tunnel as an IP. A name is looked up at m
     valid_ip "$h" && { echo "$h"; return 0; }
     [[ -n "$h" ]] || return 0
     f="$TUNE_DIR/ipcache/${h//[^A-Za-z0-9._-]/_}"
-    printf -v now '%(%s)T' -1 2> /dev/null || now=$(date +%s)
+    printf -v now '%(%s)T' -1 2> /dev/null; [[ "$now" =~ ^[0-9]{9,}$ ]] || now=$(date +%s)         # (bash older than 4.3 prints -1 for "now")
     if [[ -r "$f" ]]; then read -r t ip < "$f"; [[ "$t" =~ ^[0-9]+$ ]] && (( now - t < 60 )) && { echo "$ip"; return 0; }; fi
     ip=$(timeout 3 getent ahosts "$h" 2> /dev/null | awk '{ print $1; exit }')
     mkdir -p "$TUNE_DIR/ipcache" 2> /dev/null && echo "$now $ip" > "$f" 2> /dev/null
     echo "$ip"
 }
+tune_ip_forget() { [[ -n "$1" ]] && rm -f "$TUNE_DIR/ipcache/${1//[^A-Za-z0-9._-]/_}"; return 0; }       # an interactive action wants the answer of NOW (the lookup may have failed a moment ago)
 tune_route_get() { local fam="-4"; is_ipv6 "$1" && fam="-6"; ip $fam -o route get "$1" 2> /dev/null | head -1; }
 tune_route_set() {    # tune_route_set <ip> <attrs...> -> 0 ok · 1 a route that is not ours is in the way · 2 failed (undone)
     local ip="$1"; shift
@@ -3057,7 +3104,8 @@ tune_dest_attrs() {    # tune_dest_attrs <ip> [port to ignore] -> attributes for
     local ip="$1" skip="${2:-}" port d m prof pmtu best="" rank bestrank=0 mtu="" ri kind devmtu attrs
     while IFS='|' read -r port d m prof pmtu _; do
         [[ -n "$port" && "$port" != "$skip" && -n "$prof$pmtu" ]] || continue       # an untuned tunnel adds nothing - and is not even resolved
-        [[ "$(tune_dest_ip "$d")" == "$ip" ]] || continue
+        if valid_ip "$d"; then [[ "$d" == "$ip" ]] || continue                       # an address needs no process; only a name is looked up
+        else [[ "$(tune_dest_ip "$d")" == "$ip" ]] || continue; fi
         if [[ "$m" != iptables ]]; then
             case "$prof" in gaming) rank=4 ;; bandwidth) rank=3 ;; multiuser) rank=2 ;; *) rank=0 ;; esac
             (( rank > bestrank )) && { bestrank=$rank; best="$prof"; }
@@ -3114,6 +3162,7 @@ tune_apply_tunnel() {    # tune_apply_tunnel <port> [force]: route attributes + 
     local port="$1" force="${2:-}" P_DEST="" ip      # so it costs next to nothing on a server whose tunnels were never tuned ("force": the caller just changed or cleared them)
     [[ -f "$PORTS_DIR/$port" ]] || return 0
     [[ -n "$force" ]] || tune_any_config || [[ -s "$TUNE_DIR/mss.ports" ]] || return 0
+    [[ -n "$force" ]] || tune_port_tuned "$port" || tune_mss_listed "$port" || return 0      # an untuned tunnel needs nothing (and its name is not looked up): the route follows the TUNED ones
     P_DEST=$(port_get "$port" P_DEST)
     ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || return 0
     tune_apply_dest "$ip"; tune_mss_apply "$port"
@@ -3150,13 +3199,13 @@ assist_profile_set() {    # assist_profile_set <port> <profile>
         haproxy) echo -e "   • route to ${P_DEST}: $(profile_route_attrs "$prof" | sed 's/^$/(default)/')"
                  echo -e "   • HAProxy keep-alive / timeouts / limits for this tunnel (graceful reload)" ;;
     esac
-    [[ "$P_BLOCKED" == 1 ]] && echo -e "   ${Y}• this tunnel is blocked right now: the profile is only stored and takes effect when it is unblocked${NC}"
+    [[ "$P_BLOCKED" == 1 ]] && echo -e "   ${Y}• this tunnel is blocked right now: the profile is only stored; it takes effect after the tunnel is unblocked and 'pfm restore' has run${NC}"
     local curp; curp=$(port_profile "$port"); [[ "${curp:-balanced}" != "$prof" ]] || { echo -e "\n  ${G}This profile is already active.${NC}"; return 0; }
     confirm "Apply profile '$lbl'?" y || return 1
     if [[ "$prof" == balanced ]]; then port_unset "$port" P_PROFILE; else port_set "$port" P_PROFILE "$prof"; fi
     if [[ "$P_BLOCKED" == 1 ]]; then       # starting a blocked tunnel's engine would open it again: store only
         tune_hist profile ":$port -> $lbl (stored; tunnel is blocked)"
-        echo -e "  ${G}Stored.${NC} ${GR}It is applied when the tunnel is unblocked (or after 'pfm restore').${NC}"; return 0
+        echo -e "  ${G}Stored.${NC} ${GR}It takes effect after the tunnel is unblocked and 'pfm restore' (or a reboot) has run.${NC}"; return 0
     fi
     local up=1
     case "$P_METHOD" in
@@ -3185,7 +3234,7 @@ assist_mtu() {    # assist_mtu <port>
     local port="$1" ip ri dev kind devmtu ovh remote inner pm bh target umtu upath cap note="" floor=576 had=0 fam="-4" plen=32
     valid_port "$port" && [[ -f "$PORTS_DIR/$port" ]] || { echo -e "  ${R}There is no tunnel on port '${port}'.${NC}"; return 1; }
     local P_DEST="" P_METHOD="iptables" P_TUNE_MTU=""; source "$PORTS_DIR/$port"
-    ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || { echo -e "  ${R}Destination does not resolve.${NC}"; return 1; }
+    tune_ip_forget "$P_DEST"; ip=$(tune_dest_ip "$P_DEST"); [[ -n "$ip" ]] || { echo -e "  ${R}Destination does not resolve.${NC}"; return 1; }
     is_ipv6 "$ip" && { floor=1280; fam="-6"; plen=128; }
     ensure_tool ping "MTU test" || { echo -e "  ${R}ping is required.${NC}"; return 1; }
     ri=$(probe_route "$ip"); dev=$(kvget "$ri" dev); kind=$(kvget "$ri" kind); devmtu=$(kvget "$ri" devmtu); ovh=$(kvget "$ri" overhead); remote=$(kvget "$ri" remote)
@@ -3250,8 +3299,12 @@ assist_mtu() {    # assist_mtu <port>
     port_set "$port" P_TUNE_MTU "$target"
     tune_apply_tunnel "$port" force
     tune_hist mtu ":$port path MTU $pm -> pinned $target on $dev"
-    inner=$(probe_mtu "$ip" "$target")
-    echo -e "  ${G}Applied.${NC} ${GR}Check: $(kvget "$inner" pmtu) bytes cross the path now. Run the Bench Test to measure the effect.${NC}"
+    if tune_needs_heal "$port"; then       # stored, but the system would not take the route pin / the MSS rule: do not claim more than that
+        echo -e "  ${Y}The MTU ($target) is stored, but the route pin / MSS rule could not be installed on this system.${NC} ${GR}It is retried every 30 minutes; 'pfm doctor' shows more.${NC}"
+    else
+        inner=$(probe_mtu "$ip" "$target")
+        echo -e "  ${G}Applied.${NC} ${GR}Check: $(kvget "$inner" pmtu) bytes cross the path now. Run the Bench Test to measure the effect.${NC}"
+    fi
     tune_route_note
 }
 assist_mss() {    # assist_mss <port>
@@ -3269,7 +3322,8 @@ assist_mss() {    # assist_mss <port>
     confirm "Clamp the MSS of :$port to $(( mtu - 40 ))?" y || return 1
     port_set "$port" P_TUNE_MTU "$mtu"; tune_apply_tunnel "$port" force
     tune_hist mss ":$port TCP MSS clamped to $(( mtu - 40 ))"
-    echo -e "  ${G}Done.${NC}"
+    if tune_needs_heal "$port"; then echo -e "  ${Y}Stored, but the MSS rule could not be installed on this system.${NC} ${GR}It is retried every 30 minutes; 'pfm doctor' shows more.${NC}"
+    else echo -e "  ${G}Done.${NC}"; fi
 }
 
 assist_label() {
@@ -3320,20 +3374,20 @@ dns_bogon() {    # private / reserved address in an answer for a public name = a
     (( a == 100 && b >= 64 && b <= 127 )) && return 0
     return 1
 }
-dns_query() {    # dns_query <ip[#port]> <name> -> "<STATUS> <ms> <ips>"
-    local spec="$1" name="$2" ip="${1%%#*}" port=53 out st ms ips
+dns_query() {    # dns_query <ip[#port]> <name> [A|AAAA] -> "<STATUS> <ms> <addresses>"
+    local spec="$1" name="$2" type="${3:-A}" ip="${1%%#*}" port=53 out st ms ips
     [[ "$spec" == *#* ]] && port="${spec##*#}"
-    out=$(dig +tries=1 +time=2 +noall +comments +answer +stats -p "$port" @"$ip" "$name" A 2>&1)
+    out=$(dig +tries=1 +time=2 +noall +comments +answer +stats -p "$port" @"$ip" "$name" "$type" 2>&1)
     st=$(sed -n 's/.*status: \([A-Z]*\).*/\1/p' <<< "$out" | head -1)
     [[ -n "$st" ]] || { echo "TIMEOUT -1"; return 1; }
     ms=$(sed -n 's/.*Query time: \([0-9]*\) msec.*/\1/p' <<< "$out" | head -1)
-    ips=$(awk '$4 == "A" { print $5 }' <<< "$out" | tr '\n' ',')
+    ips=$(awk -v t="$type" '$4 == t { print $5 }' <<< "$out" | tr '\n' ',')
     echo "$st ${ms:-0} ${ips%,}"
 }
 med() { awk '{ for (i = 1; i <= NF; i++) v[++n] = $i } END { if (n == 0) { print -1; exit } for (i = 2; i <= n; i++) { t = v[i]; for (j = i - 1; j >= 1 && v[j] > t; j--) v[j+1] = v[j]; v[j+1] = t } print v[int((n + 1) / 2)] }' <<< "$1"; }
 dns_bench_one() {    # dns_bench_one <spec> <domains...> ("!name" = a name a tunnel needs - it must resolve) -> spec|ok|total|warm ms|fresh ms|bogus|nxdomain-rewrites|alive|required failures
     local spec="$1"; shift
-    local d r st ms ips i ok=0 tot=0 bogus=0 nx=0 warm="" cold="" n=0 name req rfail=0
+    local d r st ms ips st6 ms6 ips6 i ok=0 tot=0 bogus=0 nx=0 warm="" cold="" n=0 name req rfail=0
     r=$(dns_query "$spec" "${1#!}")
     [[ "${r%% *}" == TIMEOUT ]] && { echo "$spec|0|0|-1|-1|0|0|0|0"; return 0; }
     for d in "$@"; do
@@ -3344,7 +3398,10 @@ dns_bench_one() {    # dns_bench_one <spec> <domains...> ("!name" = a name a tun
             ok=$((ok + 1)); warm+=" $ms"
             # a tunnel's own name may point to a private address on purpose; only public names are judged by that
             (( req )) || for i in ${ips//,/ }; do dns_bogon "$i" && bogus=$((bogus + 1)); done
-        elif (( req )); then rfail=$((rfail + 1)); fi
+        elif (( req )); then          # a name a tunnel needs may be IPv6-only: an AAAA answer counts as resolved too
+            read -r st6 ms6 ips6 <<< "$(dns_query "$spec" "$d" AAAA)"
+            if [[ "$st6" == NOERROR && -n "$ips6" ]]; then (( ok += 1 )); warm+=" $ms6"; else (( rfail += 1 )); fi
+        fi
     done
     for d in "$@"; do    # a name that cannot exist forces a real lookup; a resolver that "finds" it rewrites NXDOMAIN
         [[ "$d" == '!'* ]] && continue
@@ -3365,34 +3422,38 @@ dns_mode() {    # resolved / nm / classic = we can change it · symlink / manage
     elif [[ -L "$RESOLV_CONF" ]]; then echo symlink
     else echo classic; fi
 }
-dns_current_line() { dns_system_resolvers | tr '\n' ' '; }
-dns_write_file() { cat "$2" > "$1" 2> /dev/null && cmp -s "$2" "$1"; }          # dns_write_file <target> <content file>: written AND read back
+dns_current_line() {    # every nameserver in use, a local stub (127.x) included: it is what this machine really asks
+    { awk '/^nameserver/ { print $2 }' "$RESOLV_CONF" 2> /dev/null
+      command -v resolvectl > /dev/null 2>&1 && resolvectl dns 2> /dev/null | sed 's/^[^:]*://' | tr ' ' '\n'
+    } | grep -E '^[0-9A-Fa-f:.]+$' | awk '!s[$0]++' | tr '\n' ' '
+}
+dns_write_file() { { cat "$2" > "$1"; } 2> /dev/null && cmp -s "$2" "$1"; }          # dns_write_file <target> <content file>: written AND read back
 dns_apply() {    # dns_apply <ip1> [ip2 ...]
-    local mode backup="$TUNE_DIR/dns.orig" servers="$*" t ip keep="" cur
+    local mode backup="$TUNE_DIR/dns.orig" servers="$*" t ip keep="" fresh=0
     mode=$(dns_mode); tune_init
     case "$mode" in symlink|managed) echo -e "  ${Y}$RESOLV_CONF is managed by another tool (a symlink / NetworkManager plugin / resolvconf). Set these resolvers there instead: ${servers}${NC}"; return 1 ;; esac
     if [[ ! -s "$TUNE_DIR/dns.conf" ]]; then        # nothing of ours is active: this is the moment to remember the original (an older backup would be stale)
-        rm -rf "$backup"; mkdir -p "$backup"
+        rm -rf "$backup"; mkdir -p "$backup"; fresh=1
         echo "$mode" > "$backup/mode"; [[ -f "$RESOLV_CONF" ]] && cp -P "$RESOLV_CONF" "$backup/resolv.conf" 2> /dev/null
     fi
-    case "$mode" in
+    case "$mode" in           # (a failure below removes the backup it just made: a copy of a file that was never changed must never be "restored" later)
         resolved)
             mkdir -p "$RESOLVED_DIR"
             printf '[Resolve]\nDNS=%s\nFallbackDNS=8.8.8.8 9.9.9.9\nDomains=~.\n' "$servers" > "$RESOLVED_DIR/90-pfm-dns.conf"
-            systemctl restart systemd-resolved 2> /dev/null ;;
+            systemctl restart systemd-resolved 2> /dev/null ;;       # (whether names still resolve is checked by the caller, which rolls back)
         nm)
             mkdir -p "$NM_DIR"
             printf '[global-dns-domain-*]\nservers=%s\n' "${servers// /,}" > "$NM_DIR/90-pfm-dns.conf"
-            systemctl reload NetworkManager 2> /dev/null || { rm -f "$NM_DIR/90-pfm-dns.conf"; echo -e "  ${R}NetworkManager did not accept the change.${NC}"; return 1; } ;;
+            systemctl reload NetworkManager 2> /dev/null || { rm -f "$NM_DIR/90-pfm-dns.conf"; (( fresh )) && rm -rf "$backup"; echo -e "  ${R}NetworkManager did not accept the change.${NC}"; return 1; } ;;
         classic)
             # our resolvers first, then the ORIGINAL first resolver as a fallback (a private / DHCP resolver that still answers when ours is unreachable), then search/options lines
             for ip in $(awk '/^nameserver/ { print $2 }' "$backup/resolv.conf" 2> /dev/null); do [[ " $servers " == *" $ip "* ]] || { keep="$ip"; break; }; done
-            t=$(mktemp) || return 1
+            t=$(mktemp) || { (( fresh )) && rm -rf "$backup"; return 1; }
             { for ip in $servers; do echo "nameserver $ip"; done; [[ -n "$keep" ]] && echo "nameserver $keep"; grep -v '^nameserver' "$RESOLV_CONF" 2> /dev/null; } > "$t"
             if ! dns_write_file "$RESOLV_CONF" "$t"; then
                 echo -e "  ${R}Could not write $RESOLV_CONF - putting the old content back.${NC}"
-                [[ -f "$backup/resolv.conf" ]] && cat "$backup/resolv.conf" > "$RESOLV_CONF" 2> /dev/null
-                rm -f "$t"; return 1
+                [[ -f "$backup/resolv.conf" ]] && { cat "$backup/resolv.conf" > "$RESOLV_CONF"; } 2> /dev/null
+                rm -f "$t"; (( fresh )) && rm -rf "$backup"; return 1
             fi
             rm -f "$t" ;;
     esac
@@ -3400,16 +3461,19 @@ dns_apply() {    # dns_apply <ip1> [ip2 ...]
     return 0
 }
 dns_revert() {    # puts back what is actually in effect (not what was planned); prints how many things were restored
-    local backup="$TUNE_DIR/dns.orig" mode n=0
-    [[ -s "$TUNE_DIR/dns.conf" || -d "$backup" ]] || { echo 0; return 0; }
+    local backup="$TUNE_DIR/dns.orig" mode n=0 keep=0
+    # nothing of ours is active: a backup that is lying around is stale and is never restored over what the admin has now
+    if [[ ! -s "$TUNE_DIR/dns.conf" ]]; then [[ -d "$backup" ]] && rm -rf "$backup"; echo 0; return 0; fi
     mode=$(kv_get "$TUNE_DIR/dns.conf" mode); [[ -n "$mode" ]] || mode=$(cat "$backup/mode" 2> /dev/null)
     if [[ -f "$RESOLVED_DIR/90-pfm-dns.conf" ]]; then rm -f "$RESOLVED_DIR/90-pfm-dns.conf"; systemctl restart systemd-resolved 2> /dev/null; n=$((n + 1)); fi
     if [[ -f "$NM_DIR/90-pfm-dns.conf" ]]; then rm -f "$NM_DIR/90-pfm-dns.conf"; systemctl reload NetworkManager 2> /dev/null; n=$((n + 1)); fi
     if [[ "$mode" == classic && -f "$backup/resolv.conf" ]]; then
         if [[ -L "$RESOLV_CONF" ]]; then log "dns revert: $RESOLV_CONF is a symlink now (another tool took it over) - left alone"
-        elif dns_write_file "$RESOLV_CONF" "$backup/resolv.conf"; then n=$((n + 1)); fi
+        elif dns_write_file "$RESOLV_CONF" "$backup/resolv.conf"; then n=$((n + 1))
+        else keep=1; log "dns revert: $RESOLV_CONF could not be written - the saved original stays in $backup"; fi          # the only copy of the original is not thrown away
     fi
-    rm -rf "$backup"; rm -f "$TUNE_DIR/dns.conf"; echo "$n"
+    (( keep )) || { rm -rf "$backup"; rm -f "$TUNE_DIR/dns.conf"; }
+    echo "$n"
 }
 dns_heal() {    # a DHCP client or cloud-init may rewrite a plain resolv.conf: put ours back (never over a file another tool owns, never when our resolver stopped answering)
     [[ -s "$TUNE_DIR/dns.conf" ]] || return 0
@@ -3433,7 +3497,10 @@ assist_dns() {
     for f in "$PORTS_DIR"/*; do    # the names the tunnels themselves resolve: a resolver that cannot answer them is not an option
         [[ -f "$f" ]] || continue
         h=$(port_get "${f##*/}" P_DEST)
-        valid_ip "$h" || [[ -z "$h" ]] || { doms+=("!$h"); hn=$((hn + 1)); }
+        valid_ip "$h" || [[ -z "$h" ]] && continue
+        [[ " ${doms[*]} " == *" !$h "* ]] && continue                                       # one name, however many tunnels use it
+        grep -qiwF -- "$h" "${PFM_HOSTS_FILE:-/etc/hosts}" 2> /dev/null && continue        # a name only /etc/hosts knows is no resolver's business
+        doms+=("!$h"); hn=$((hn + 1))
     done
     echo -e "\n  ${B}${W}DNS benchmark${NC}\n  ${GR}Each resolver is asked $(( ${#doms[@]} - hn )) public names twice (cache speed) and 3 names that cannot exist (real lookup speed)$( ((hn)) && echo ", plus $hn name(s) your tunnels use" ).${NC}"
     echo -e "  ${GR}A resolver that answers a public name with a private address, invents answers for missing names, or cannot resolve your tunnels' names is rejected.${NC}\n"
@@ -3462,12 +3529,15 @@ assist_dns() {
     while IFS='|' read -r score label addr warm fresh okp note; do
         if [[ -n "$note" ]]; then printf "   ${R}%-14s %-16s %8s %8s %6s  %s${NC}\n" "$label" "$addr" "-" "-" "$okp" "$note"
         else
-            local mark=""; (( ${#best_ip[@]} < 2 )) && { best_ip+=("$addr"); mark="${G}<- best${NC}"; }
+            local mark=""
+            if (( ${#best_ip[@]} < 2 )) && [[ " ${best_ip[*]} " != *" $addr "* ]]; then best_ip+=("$addr"); mark="${G}<- best${NC}"; fi
             printf "   %-14s %-16s %6s ms %6s ms %6s  %b\n" "$label" "$addr" "$warm" "$fresh" "$okp" "$mark"
         fi
     done < <(printf '%s\n' "${rows[@]}" | sort)
     echo ""
     if (( ${#best_ip[@]} == 0 )); then echo -e "  ${R}No resolver passed. Keep the current one.${NC}"; return 1; fi
+    local cur_first; cur_first=$(awk '/^nameserver/ { print $2 }' "$RESOLV_CONF" 2> /dev/null | head -n "${#best_ip[@]}" | tr '\n' ' ')
+    if [[ "$cur_first" == "${best_ip[*]} " ]]; then echo -e "  ${G}Your current resolvers (${best_ip[*]}) are already the best of the ones tested - nothing to change.${NC}"; return 0; fi
     echo -e "  ${GR}Current: $(dns_current_line)${NC}"
     echo -e "  ${GR}Proposed: ${best_ip[*]}   (mode: $(dns_mode))${NC}"
     [[ "$(dns_mode)" == classic ]] && echo -e "  ${GR}The first of your current resolvers stays behind them as a fallback.${NC}"
@@ -3531,7 +3601,7 @@ assist_recommended() {    # what the last Bench Tests asked for (newest first, o
     done
 }
 quick_plan() {    # every change Quick Optimize makes, as a table - nothing is applied that is not listed here
-    local pl="" dev nic sq fq=""
+    local pl="" dev fq=""
     if [[ "$(sys_get net.ipv4.tcp_congestion_control)" == bbr ]] || bbr_available; then
         fq=fq; pl+=$(sysctl_row "congestion control" net.ipv4.tcp_congestion_control bbr)$'\n'
         sys_has net.core.default_qdisc && pl+=$(sysctl_row "queue discipline (default)" net.core.default_qdisc fq)$'\n'
@@ -3542,11 +3612,7 @@ quick_plan() {    # every change Quick Optimize makes, as a table - nothing is a
     pl+=$(sysctl_row_tcpmem "TCP send window max" net.ipv4.tcp_wmem 33554432)$'\n'
     pl+=$(limits_plan)$'\n'
     dev=$(nic_default_dev)
-    if [[ -n "$dev" ]]; then
-        nic=$(nic_plan "$dev" "$fq"); pl+="$nic"$'\n'
-        [[ "$nic" == *"spread RX"* ]] && pl+=$(sysctl_row "RPS flow table" net.core.rps_sock_flow_entries 32768 raise)$'\n'
-    fi
-    sq=$(softnet_stat | awk '{ print $2 }'); [[ "$sq" =~ ^[0-9]+$ ]] && (( sq > 0 )) && pl+=$(sysctl_row "NAPI budget (CPU squeezed)" net.core.netdev_budget 600 raise)$'\n'
+    [[ -n "$dev" ]] && pl+=$(nic_plan "$dev" "$fq")$'\n'
     echo "$pl" | sed '/^$/d'
 }
 assist_quick() {
@@ -3588,7 +3654,7 @@ assist_status() {
 tune_routes_flush() { local fam; for fam in -4 -6; do ip $fam route flush proto "$PFM_ROUTE_PROTO" 2> /dev/null; done; return 0; }      # every route the assistant ever made carries this protocol number
 tune_revert_all() {    # tune_revert_all [quiet]
     local q="${1:-}" f dev n port m d dp
-    n=$(tune_sysctl_revert); [[ -z "$q" ]] && echo -e "   kernel settings restored: $n"
+    n=$(tune_sysctl_revert); n=$(( n + $(tune_misc_revert) )); [[ -z "$q" ]] && echo -e "   kernel settings restored: $n"
     n=$(nic_revert); [[ -z "$q" ]] && echo -e "   network card settings restored: $n"
     n=$(dns_revert); [[ -z "$q" ]] && echo -e "   DNS restored: $n"
     if [[ -s "$TUNE_DIR/mtu.devs" ]]; then while IFS='=' read -r dev _; do [[ -n "$dev" ]] && reset_mtu "$dev"; done < "$TUNE_DIR/mtu.devs"; : > "$TUNE_DIR/mtu.devs"; fi
@@ -3632,23 +3698,25 @@ tune_needs_heal() {    # 0 = this tunnel has tuning (profile / pinned MTU) whose
 TUNE_REFRESH_GAP="${PFM_TUNE_REFRESH_GAP:-240}"
 tune_routes_refresh() {    # a host route copies the next hop / source address of the route it shadows; a DHCP renewal or a failover makes the copy stale
     [[ -d "$TUNE_DIR" ]] || return 0               # the assistant was never used on this server: there is nothing of ours to refresh
-    local stamp="$TUNE_DIR/routes.stamp" now last ip done_ips=" " port d m prof pmtu          # -> rebuild them from the routing table as it is now, at most every few minutes
+    local stamp="$TUNE_DIR/routes.stamp" now last ip done_ips=" " port d m prof pmtu unresolved=0          # -> rebuild them from the routing table as it is now, at most every few minutes
     now=$(date +%s); last=$(cat "$stamp" 2> /dev/null); [[ "$last" =~ ^[0-9]+$ ]] || last=0
     (( now - last >= TUNE_REFRESH_GAP )) || return 0
     echo "$now" > "$stamp"
     while IFS='|' read -r port d m prof pmtu _; do
         [[ -n "$prof$pmtu" ]] || continue
-        ip=$(tune_dest_ip "$d"); [[ -n "$ip" && "$done_ips" != *" $ip "* ]] || continue
+        ip=$(tune_dest_ip "$d"); [[ -n "$ip" ]] || { unresolved=1; continue; }        # (a name that does not resolve right now keeps its route)
+        [[ "$done_ips" != *" $ip "* ]] || continue
         done_ips+="$ip "; tune_apply_dest "$ip"
     done < <(tune_port_table)
-    # routes of ours that no tuned tunnel points at any more (a hostname that moved to another address, a port file edited by hand)
-    local fam r
-    for fam in -4 -6; do
-        while read -r r _; do
-            [[ -n "$r" ]] || continue
-            [[ "$done_ips" == *" ${r%/*} "* ]] || ip $fam route del "$r" proto "$PFM_ROUTE_PROTO" 2> /dev/null
-        done < <(ip $fam route show proto "$PFM_ROUTE_PROTO" 2> /dev/null)
-    done
+    # routes of ours that no tuned tunnel points at any more (a hostname that moved to another address, a port file edited by hand).
+    # Only while every name resolved - with an unknown name a live route cannot be told from a leftover - and only IPv4: the kernel prints an
+    # IPv6 address in its own canonical spelling, which need not be the one typed in the port file.
+    (( unresolved )) && return 0
+    local r
+    while read -r r _; do
+        [[ -n "$r" ]] || continue
+        [[ "$done_ips" == *" ${r%/*} "* ]] || ip -4 route del "$r" proto "$PFM_ROUTE_PROTO" 2> /dev/null
+    done < <(ip -4 route show proto "$PFM_ROUTE_PROTO" 2> /dev/null)
     return 0
 }
 tune_heal() {    # from `pfm sync` (every 5 minutes): whatever lost its setting gets it back
@@ -4793,7 +4861,7 @@ cmd_uninstall() {
     [[ "$c" != "YES" ]] && return
     for f in "$PORTS_DIR"/*; do [[ -f "$f" ]] && remove_rules "$(basename "$f")"; done
     cleanup_old; remove_all_mtu
-    tune_sysctl_revert > /dev/null; nic_revert > /dev/null; dns_revert > /dev/null; tune_routes_flush     # give the system back its own settings
+    tune_sysctl_revert > /dev/null; tune_misc_revert > /dev/null; nic_revert > /dev/null; dns_revert > /dev/null; tune_routes_flush     # give the system back its own settings
     for svc in /etc/systemd/system/pfm-realm-*.service; do
         [[ -f "$svc" ]] && { local sn=$(basename "$svc" .service); systemctl stop "$sn" 2>/dev/null; systemctl disable "$sn" 2>/dev/null; rm -f "$svc"; }
     done
