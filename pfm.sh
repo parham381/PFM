@@ -58,7 +58,7 @@ check_root() {    # typing `PFM` as a normal user asks sudo instead of giving up
         echo -e "${GR}PFM needs root - asking sudo ...${NC}" >&2
         exec sudo bash "$PFM_SELF" "${PFM_ARGS[@]}"
     fi
-    echo -e "${R}Run as root${NC}  ${GR}(for example: sudo PFM)${NC}"; exit 1
+    echo -e "${R}Run as root${NC}  ${GR}(sudo -i first, or put sudo in front of the command: sudo PFM)${NC}"; exit 1
 }
 
 human_bytes() {
@@ -2497,7 +2497,6 @@ limits_plan() {    # prints the rows that would change
     sysctl_row "SYN backlog" net.ipv4.tcp_max_syn_backlog 8192 raise
     sysctl_row "receive queue per CPU" net.core.netdev_max_backlog 16384 raise
     sysctl_row "open files (system)" fs.file-max 1048576 raise
-    sysctl_row "local port range" net.ipv4.ip_local_port_range "1024 65535"
 }
 limits_apply() {
     local mem ct
@@ -2506,7 +2505,6 @@ limits_apply() {
     tune_raise net.netfilter.nf_conntrack_max "$ct"
     tune_raise net.core.somaxconn 8192; tune_raise net.ipv4.tcp_max_syn_backlog 8192
     tune_raise net.core.netdev_max_backlog 16384; tune_raise fs.file-max 1048576
-    sys_has net.ipv4.ip_local_port_range && tune_sysctl net.ipv4.ip_local_port_range "1024 65535"
     # a hash table sized for the larger limit keeps lookups fast
     local hs="${PFM_CT_HASHSIZE:-/sys/module/nf_conntrack/parameters/hashsize}" want
     if [[ -w "$hs" ]]; then want=$(( $(sys_get net.netfilter.nf_conntrack_max) / 4 )); [[ "$(cat "$hs")" -lt "$want" ]] && echo "$want" > "$hs" 2> /dev/null; fi
@@ -2717,11 +2715,13 @@ tune_route_set() {    # tune_route_set <ip> <attrs...> -> 0 ok · 1 a route that
     local ip="$1"; shift
     local fam="-4" plen=32 l dev via src mine other after
     is_ipv6 "$ip" && { fam="-6"; plen=128; }
-    l=$(tune_route_get "$ip"); [[ -n "$l" ]] || return 2
-    dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$l"); via=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<< "$l"); src=$(sed -n 's/.* src \([^ ]*\).*/\1/p' <<< "$l")
     mine=$(ip $fam route show exact "$ip/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null | head -1)
     other=$(ip $fam route show exact "$ip/$plen" 2> /dev/null | head -1)
     [[ -n "$other" && -z "$mine" ]] && return 1
+    # our earlier route would answer the lookup below with its own, possibly stale, next hop: take it away first
+    [[ -n "$mine" ]] && ip $fam route del "$ip/$plen" proto "$PFM_ROUTE_PROTO" 2> /dev/null
+    l=$(tune_route_get "$ip"); [[ -n "$l" ]] || return 2
+    dev=$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$l"); via=$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<< "$l"); src=$(sed -n 's/.* src \([^ ]*\).*/\1/p' <<< "$l")
     ip $fam route replace "$ip/$plen" ${via:+via "$via"} dev "$dev" ${src:+src "$src"} proto "$PFM_ROUTE_PROTO" "$@" 2> /dev/null || return 2
     after=$(tune_route_get "$ip")
     if [[ "$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$after")" != "$dev" || "$(sed -n 's/.* via \([^ ]*\).*/\1/p' <<< "$after")" != "$via" ]]; then
@@ -3219,6 +3219,28 @@ tune_needs_heal() {    # 0 = this tunnel has tuning (profile / pinned MTU) whose
     fi
     return 1
 }
+TUNE_REFRESH_GAP="${PFM_TUNE_REFRESH_GAP:-240}"
+tune_routes_refresh() {    # a host route copies the next hop / source address of the route it shadows; a DHCP renewal or a failover makes the copy stale
+    local stamp="$TUNE_DIR/routes.stamp" now last f ip done_ips=" "          # -> rebuild them from the routing table as it is now, at most every few minutes
+    now=$(date +%s); last=$(cat "$stamp" 2> /dev/null); [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= TUNE_REFRESH_GAP )) || return 0
+    echo "$now" > "$stamp"
+    for f in "$PORTS_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        grep -qE '^P_(PROFILE|TUNE_MTU)=.' "$f" || continue
+        ip=$(tune_dest_ip "$(P_DEST=""; . "$f" 2> /dev/null; echo "$P_DEST")"); [[ -n "$ip" && "$done_ips" != *" $ip "* ]] || continue
+        done_ips+="$ip "; tune_apply_dest "$ip"
+    done
+    # routes of ours that no tuned tunnel points at any more (a hostname that moved to another address, a port file edited by hand)
+    local fam r
+    for fam in -4 -6; do
+        while read -r r _; do
+            [[ -n "$r" ]] || continue
+            [[ "$done_ips" == *" ${r%/*} "* ]] || ip $fam route del "$r" proto "$PFM_ROUTE_PROTO" 2> /dev/null
+        done < <(ip $fam route show proto "$PFM_ROUTE_PROTO" 2> /dev/null)
+    done
+    return 0
+}
 tune_heal() {    # from `pfm sync` (every 5 minutes): whatever lost its setting gets it back
     local d f port
     d=$(tune_sysctl_drift); if [[ -n "$d" ]]; then tune_sysctl_restore; log "HEAL sysctl re-applied: $(echo $d)"; fi
@@ -3228,6 +3250,7 @@ tune_heal() {    # from `pfm sync` (every 5 minutes): whatever lost its setting 
         [[ -f "$f" ]] || continue; port=$(basename "$f")
         tune_needs_heal "$port" && { tune_apply_tunnel "$port"; log "HEAL tuning of $port (route / MSS rule had disappeared)"; }
     done
+    tune_routes_refresh
     return 0
 }
 
@@ -3406,7 +3429,9 @@ install_self() {    # put this very script at /usr/local/bin/pfm; the program it
 }
 install_shortcuts() {    # `PFM` (capital) opens the panel from anywhere; `pfm` keeps working; tab completion for both
     ln -sf pfm /usr/local/bin/PFM 2> /dev/null
-    case ":$PATH:" in *:/usr/local/bin:*) ;; *) ln -sf "$PFM_BIN" /usr/bin/PFM 2> /dev/null; ln -sf "$PFM_BIN" /usr/bin/pfm 2> /dev/null ;; esac
+    case ":$PATH:" in *:/usr/local/bin:*) ;;      # /usr/local/bin is not on this PATH: link into /usr/bin, but never over a file that is not ours
+        *) [[ -e /usr/bin/PFM || -L /usr/bin/PFM ]] || ln -s "$PFM_BIN" /usr/bin/PFM 2> /dev/null
+           [[ -e /usr/bin/pfm || -L /usr/bin/pfm ]] || ln -s "$PFM_BIN" /usr/bin/pfm 2> /dev/null ;; esac
     if [[ -d /etc/bash_completion.d ]]; then
         cat > /etc/bash_completion.d/pfm << 'COMP'
 _pfm_complete() {
@@ -3440,8 +3465,11 @@ CONF
     fi
 }
 remove_shortcuts() {
-    local l
-    for l in /usr/local/bin/PFM /usr/bin/PFM /usr/bin/pfm; do [[ -L "$l" ]] && rm -f "$l"; done
+    local l t
+    for l in /usr/local/bin/PFM /usr/bin/PFM /usr/bin/pfm; do   # only links that point at our program
+        [[ -L "$l" ]] || continue
+        t=$(readlink "$l"); [[ "$t" == pfm || "$t" == "$PFM_BIN" ]] && rm -f "$l"
+    done
     rm -f /etc/bash_completion.d/pfm
 }
 
@@ -3502,7 +3530,7 @@ ver_list_remote() {    # tag|date|title for every release; GitHub API first, the
         out=$(ver_parse_atom <<< "$body" | ver_sort_desc); [[ -n "$out" ]] && { echo "$out"; return 0; }
     fi
     if command -v git > /dev/null 2>&1; then
-        out=$(timeout 25 git ls-remote --tags --refs "$PFM_GIT_URL" 2> /dev/null | sed -nE 's#.*refs/tags/(v?[0-9][0-9A-Za-z.+-]*)$#\1||#p' | ver_sort_desc)
+        out=$(timeout 10 git ls-remote --tags --refs "$PFM_GIT_URL" 2> /dev/null | sed -nE 's#.*refs/tags/(v?[0-9][0-9A-Za-z.+-]*)$#\1||#p' | ver_sort_desc)
         [[ -n "$out" ]] && { echo "$out"; return 0; }
     fi
     return 1
