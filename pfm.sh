@@ -8,7 +8,7 @@
 #   ██║     ██║     ██║ ╚═╝ ██║
 #   ╚═╝     ╚═╝     ╚═╝     ╚═╝
 #
-#   Port Forward Manager v1.8
+#   Port Forward Manager v1.9
 #
 #   Telegram: https://t.me/AbrAfagh
 #
@@ -21,6 +21,11 @@ USAGE_DIR="$PFM_DIR/usage"
 MTU_DIR="$PFM_DIR/mtu"
 REALM_DIR="$PFM_DIR/realm"
 REALM_BIN="/usr/local/bin/realm"
+HEALTH_DIR="$PFM_DIR/health"
+TRAFFIC_MIN=3                                  # packets that must arrive before "none was delivered" is believed
+TRAFFIC_MIN_AGE=${PFM_TRAFFIC_MIN_AGE:-60}     # shortest window (s) a traffic verdict is based on
+BASELINE_AGE=${PFM_BASELINE_AGE:-120}          # `pfm sync` renews its counter snapshot at most this often
+WATCH_GAP=${PFM_WATCH_GAP:-30}                 # ...and looks at the tunnels at most this often (the bot calls sync a lot)
 HAPROXY_CFG="$PFM_DIR/haproxy.cfg"
 LOG_FILE="/var/log/pfm.log"
 # If you fork this repo, change this to your own raw URL so `pfm install`
@@ -136,6 +141,218 @@ fw_unallow() {
     local c ch; for c in iptables ip6tables; do
         for ch in INPUT FORWARD; do ipt_del_tag "$c" filter "$ch" "pfm_allow_$1"; done
     done
+}
+
+# ═══════════════ WHO ELSE HANDLES MY PORT ═══════════════
+# Another tool (a different tunnel manager, Docker, firewalld, a forgotten test rule...) can
+# DNAT/REDIRECT the same port in nat PREROUTING. That runs BEFORE the packet reaches realm/haproxy
+# (or pfm's own DNAT), so the tunnel looks perfect from the inside - listening, rules in place,
+# loopback tests pass - while nothing from the outside ever arrives.
+
+# `iptables-save` of one table. Within one run (sync / doctor) the listing is taken once and reused,
+# so checking many tunnels does not mean dumping the whole ruleset many times.
+rules_dump() {
+    local k="_DUMP_${1}_${2}"
+    if [[ -n "${!k+x}" ]]; then printf '%s\n' "${!k}"; else "${1}-save" -c -t "$2" 2>/dev/null; fi
+}
+nft_dump() { if [[ -n "${_DUMP_nft+x}" ]]; then printf '%s\n' "$_DUMP_nft"; else nft -a list ruleset 2>&1; fi; }
+rules_snapshot() {
+    local c t
+    for c in iptables ip6tables; do
+        command -v "${c}-save" > /dev/null 2>&1 || continue
+        for t in mangle nat; do printf -v "_DUMP_${c}_${t}" '%s' "$("${c}-save" -c -t "$t" 2>/dev/null)"; done
+    done
+    command -v nft > /dev/null 2>&1 && printf -v _DUMP_nft '%s' "$(nft -a list ruleset 2>&1)"
+    return 0
+}
+rules_snapshot_end() { unset _DUMP_iptables_mangle _DUMP_iptables_nat _DUMP_ip6tables_mangle _DUMP_ip6tables_nat _DUMP_nft; }
+
+# Does port $P fall in an iptables/nft port list such as "80,443,9000:9999"? (neg = "!" in front)
+_AWK_HIT='function hit(spec, neg,   n, a, i, r, ab, lo, hi, found) {
+    n = split(spec, a, ","); found = 0
+    for (i = 1; i <= n; i++) {
+        r = a[i]
+        if (index(r, ":")) { split(r, ab, ":"); lo = ab[1] + 0; hi = ab[2] + 0 } else { lo = r + 0; hi = lo }
+        if (P + 0 >= lo && P + 0 <= hi) found = 1
+    }
+    return neg ? !found : found
+}
+'
+
+# One TAB-separated line per rule that is not pfm's and sends <port> somewhere else:
+#     <kind> <packets> <where> <rule> <command that removes it>
+# <method> decides what counts: haproxy is TCP-only, and for the iptables method only a rule that
+# sits BEFORE pfm's own DNAT can win (pfm appends its rule at the end of PREROUTING).
+foreign_nat() {
+    local port="$1" method="$2" protos="tcp,udp" own="" cmd
+    [[ "$method" == "haproxy" ]] && protos="tcp"
+    [[ "$method" == "iptables" && -f "$PORTS_DIR/$port" ]] && own=$( P_DEST=""; P_DPORT="$port"; source "$PORTS_DIR/$port"; nat_dest "$P_DEST" "$P_DPORT" )
+    for cmd in iptables ip6tables; do
+        command -v "${cmd}-save" > /dev/null 2>&1 || continue
+        rules_dump "$cmd" nat | awk -v P="$port" -v PROTOS="$protos" -v OWN="$own" -v CMD="$cmd" "$_AWK_HIT"'
+            BEGIN { np = split(PROTOS, pl, ","); for (i = 1; i <= np; i++) okp[pl[i]] = 1 }
+            /^\[[0-9]+:[0-9]+\] -A / {
+                chain = $3
+                if (chain == "POSTROUTING" || chain == "OUTPUT") next
+                if ($0 !~ / -j (DNAT|REDIRECT)( |$)/) next
+                proto = ""; matched = 0; spec = ""; dest = ""
+                for (i = 4; i <= NF; i++) {
+                    if ($i == "-p" && $(i-1) != "!") proto = $(i+1)
+                    else if ($i ~ /^--(dports?|destination-ports?)$/) { spec = $(i+1); if (hit(spec, $(i-1) == "!")) matched = 1 }
+                    else if ($i == "--to-destination") dest = $(i+1)
+                }
+                if (!(proto in okp) || !matched) next
+                if (OWN != "" && chain == "PREROUTING") {
+                    if (spec == P && dest == OWN) { ownseen = 1; next }
+                    if (ownseen) next
+                }
+                pk = $1; sub(/^\[/, "", pk); sub(/:.*/, "", pk)
+                rule = ""; for (i = 4; i <= NF; i++) rule = rule (i > 4 ? " " : "") $i
+                printf "ipt\t%s\tnat %s\t%s\t%s -t nat -D %s %s\n", pk, chain, rule, CMD, chain, rule
+            }'
+    done
+    # rules written straight for nftables (firewalld, hand-written nft scripts). The tables that
+    # iptables-nft keeps were covered above: nft announces them ("managed by iptables-nft") on
+    # stderr before the listing, so read both streams and skip those tables.
+    command -v nft > /dev/null 2>&1 && nft_dump | awk -v P="$port" -v PROTOS="$protos" "$_AWK_HIT"'
+        BEGIN { np = split(PROTOS, pl, ","); for (i = 1; i <= np; i++) okp[pl[i]] = 1 }
+        /^# Warning: table .* is managed by iptables-nft/ { managed[$4 " " $5] = 1; next }
+        $1 == "table" { fam = $2; tname = $3; next }
+        $1 == "chain" { chain = $2; next }
+        $0 ~ /(^|[ \t])(dnat|redirect)([ \t]|$)/ && $0 ~ /dport / {
+            line = $0
+            if (index(line, "tcp dport ")) pr = "tcp"; else if (index(line, "udp dport ")) pr = "udp"; else pr = ""
+            if (pr != "" && !(pr in okp)) next
+            rest = substr(line, index(line, "dport ") + 6); neg = 0
+            if (substr(rest, 1, 3) == "!= ") { neg = 1; rest = substr(rest, 4) }
+            if (substr(rest, 1, 1) == "{") { spec = substr(rest, 2, index(rest, "}") - 2); gsub(/ /, "", spec) }
+            else { spec = rest; sub(/[ \t].*/, "", spec) }
+            gsub(/-/, ":", spec)
+            if (!hit(spec, neg)) next
+            pk = "-"; if (match(line, /packets [0-9]+/)) pk = substr(line, RSTART + 8, RLENGTH - 8)
+            h = ""; if (match(line, /# handle [0-9]+$/)) h = substr(line, RSTART + 9)
+            rule = line; sub(/[ \t]*# handle [0-9]+$/, "", rule); sub(/^[ \t]+/, "", rule); gsub(/[ \t][ \t]+/, " ", rule)
+            n++; tab[n] = fam " " tname; out[n] = sprintf("nft\t%s\tnft %s %s %s\t%s\tnft delete rule %s %s %s handle %s", pk, fam, tname, chain, rule, fam, tname, chain, h)
+        }
+        END { for (i = 1; i <= n; i++) if (!(tab[i] in managed)) print out[i] }'
+    return 0
+}
+
+# foreign_nat as readable lines (a problem report): "" = nobody else touches the port
+foreign_report() {
+    local port="$1" method="$2" kind pk where rule rm
+    while IFS=$'\t' read -r kind pk where rule rm; do
+        [[ -n "$kind" ]] || continue
+        echo "  ✗ port $port is also handled by another NAT rule ($where, $pk packets) that takes the traffic before this tunnel:"
+        echo "      $rule"
+        echo "      remove it (back up first: iptables-save > /root/iptables.bak):  $rm"
+    done < <(foreign_nat "$port" "$method")
+}
+
+# ═══════════════ DID THE TRAFFIC REACH THE TUNNEL? ═══════════════
+# Two count-only rules per tunnel (they never change a packet):
+#   pfm_seen_<port>  mangle PREROUTING  packets addressed to this server on <port> (before any NAT)
+#   pfm_got_<port>   mangle INPUT       ... handed to the local listener (realm / haproxy); not counting
+#                                       loopback, so a local `nc 127.0.0.1` test cannot hide a problem
+#                    mangle FORWARD     ... forwarded by pfm's DNAT (iptables engine; matched by the
+#                                       ORIGINAL port, so tunnels sharing a destination stay separate)
+# "seen high, got low" is the signature of a tunnel that is perfect inside and dead outside:
+# some other NAT rule, rp_filter or a firewall eats the packets in between.
+traffic_rules_apply() {
+    local port="$1" dest="$2" method="$3" cmd=iptables p
+    [[ "$method" == "iptables" ]] && cmd=$(ipt "$dest")
+    for p in tcp udp; do
+        [[ "$method" == "haproxy" && "$p" == "udp" ]] && continue
+        ipt_ensure "$cmd" mangle PREROUTING -p "$p" --dport "$port" -m addrtype --dst-type LOCAL -m comment --comment "pfm_seen_${port}" 2>/dev/null
+        if [[ "$method" == "iptables" ]]; then
+            ipt_ensure "$cmd" mangle FORWARD -p "$p" -m conntrack --ctorigdstport "$port" --ctdir ORIGINAL -m comment --comment "pfm_got_${port}" 2>/dev/null
+        else
+            ipt_ensure "$cmd" mangle INPUT ! -i lo -p "$p" --dport "$port" -m comment --comment "pfm_got_${port}" 2>/dev/null
+        fi
+    done
+}
+traffic_rules_remove() {
+    local c; for c in iptables ip6tables; do
+        ipt_del_tag "$c" mangle PREROUTING "pfm_seen_$1"
+        ipt_del_tag "$c" mangle INPUT "pfm_got_$1"
+        ipt_del_tag "$c" mangle FORWARD "pfm_got_$1"
+    done
+    rm -f "${HEALTH_DIR:?}/${1:?}"
+}
+# "<rules> <packets>": how many rules carry the tag $1 in the iptables-save listing on stdin, and
+# the sum of their packet counters
+sum_tag_pkts() {
+    awk -v T="--comment $1 " '
+        /^\[[0-9]+:[0-9]+\] -A / { l = $0 " "; if (index(l, T) == 0) next
+            p = $1; sub(/^\[/, "", p); sub(/:.*/, "", p); s += p; n++ }
+        END { print n + 0, s + 0 }'
+}
+# Are all count-only rules of the tunnel in place? (tcp+udp, haproxy: tcp only)
+traffic_rules_ok() {
+    local port="$1" dest="$2" method="$3" cmd=iptables want=2 d ns ng _
+    [[ "$method" == "iptables" ]] && cmd=$(ipt "$dest")
+    [[ "$method" == "haproxy" ]] && want=1
+    d=$(rules_dump "$cmd" mangle)
+    read -r ns _ <<< "$(sum_tag_pkts "pfm_seen_$port" <<< "$d")"
+    read -r ng _ <<< "$(sum_tag_pkts "pfm_got_$port" <<< "$d")"
+    (( ns >= want && ng >= want ))
+}
+# "<seen> <got>" since the rules were created; fails when the count-only rules are not there
+traffic_counters() {
+    local port="$1"; [[ -f "$PORTS_DIR/$port" ]] || return 1
+    local P_DEST="" P_METHOD="iptables"; source "$PORTS_DIR/$port"
+    local cmd=iptables d ns ps ng pg; [[ "$P_METHOD" == "iptables" ]] && cmd=$(ipt "$P_DEST")
+    d=$(rules_dump "$cmd" mangle)
+    read -r ns ps <<< "$(sum_tag_pkts "pfm_seen_$port" <<< "$d")"
+    read -r ng pg <<< "$(sum_tag_pkts "pfm_got_$port" <<< "$d")"
+    (( ns > 0 && ng > 0 )) || return 1
+    echo "$ps $pg"
+}
+# "<verdict> <seen> <got> <window>" - what happened to the packets that reached this server on <port>
+#   ok        packets arrived and (at least half of them) were handed to the tunnel
+#   diverted  >= TRAFFIC_MIN packets never made it to the tunnel and they are the majority
+#   idle      (almost) nothing arrived, cannot tell
+# <window> = seconds the numbers cover; 0 = since the rules were created. Recent traffic is judged
+# through the snapshot `pfm sync` (cron) keeps, so a tunnel that broke an hour ago is not hidden
+# behind the packets it carried last week.
+traffic_verdict() {
+    local port="$1" cur seen got ts ps pg now window=0 v=idle line
+    cur=$(traffic_counters "$port") || return 1
+    read -r seen got <<< "$cur"
+    now=$(date +%s)
+    # snapshot file: line 1 = latest baseline, line 2 = the one before it ("<time> <seen> <got> ...");
+    # take the newest one that is old enough to say something about recent traffic
+    if [[ -r "$HEALTH_DIR/$port" ]]; then
+        while read -r ts ps pg _; do
+            [[ "$ts" =~ ^[0-9]+$ && "$ps" =~ ^[0-9]+$ && "$pg" =~ ^[0-9]+$ ]] || continue
+            if (( now - ts >= TRAFFIC_MIN_AGE && now - ts <= 3600 && seen >= ps && got >= pg )); then
+                window=$(( now - ts )); seen=$(( seen - ps )); got=$(( got - pg )); break
+            fi
+        done < "$HEALTH_DIR/$port"
+    fi
+    if (( seen - got >= TRAFFIC_MIN && got * 2 < seen )); then v=diverted
+    elif (( got > 0 )); then v=ok; fi
+    echo "$v $seen $got $window"
+}
+fmt_window() {
+    if (( $1 >= 90 )); then echo "last $(( ($1 + 30) / 60 )) min"
+    elif (( $1 > 0 )); then echo "last ${1}s"
+    else echo "since the rules were created"; fi
+}
+
+# Problems that only show from the OUTSIDE: someone else handles the port, or packets vanish
+tunnel_capture_problems() {
+    local port="$1"; [[ -f "$PORTS_DIR/$port" ]] || return 0
+    local P_DEST="" P_METHOD="iptables" P_BLOCKED=0; source "$PORTS_DIR/$port"
+    [[ "$P_BLOCKED" == "1" ]] && return 0
+    foreign_report "$port" "$P_METHOD"
+    local v seen got win
+    read -r v seen got win <<< "$(traffic_verdict "$port")"
+    if [[ "$v" == "diverted" ]]; then
+        local what="none was handed to the tunnel"; (( got > 0 )) && what="only $got of them were handed to the tunnel"
+        echo "  ✗ $seen packets reached this server on port $port ($(fmt_window "$win")) but $what: another NAT rule, rp_filter or a firewall drops/diverts the rest"
+    fi
+    return 0
 }
 
 # ═══════════════ REALM ═══════════════
@@ -536,6 +753,7 @@ apply_port_rules() {
         *)             apply_rules_iptables "$port" "$dest" "$dport" ;;
     esac
     fw_allow "$port" "$dest" "$method" "$dport"
+    traffic_rules_apply "$port" "$dest" "$method"
 }
 # Re-create those rules from scratch without touching a running realm/haproxy process.
 # Repeated restores must never stack duplicate rules (that multiplies the counted traffic).
@@ -575,6 +793,7 @@ remove_rules() {
         *)       remove_rules_iptables "$port" "$P_DEST" "$P_DPORT" ;;
     esac
     fw_unallow "$port"
+    traffic_rules_remove "$port"
     local c ch; for c in iptables ip6tables; do
         for ch in INPUT FORWARD; do ipt_del_tag "$c" filter "$ch" "pfm_block_${port}"; done
     done
@@ -675,7 +894,7 @@ cleanup_old() {
                 local ln=$($c -t ${t% *} -L ${t#* } --line-numbers -n 2>/dev/null | grep "pfm_" | head -1 | awk '{print $1}')
                 [[ "$ln" =~ ^[0-9]+$ ]] && $c -t ${t% *} -D ${t#* } "$ln" 2>/dev/null || break
             done; done
-        for chain in FORWARD OUTPUT; do
+        for chain in PREROUTING INPUT FORWARD OUTPUT; do
             while $c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep -q "pfm_"; do
                 local ln=$($c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep "pfm_" | head -1 | awk '{print $1}')
                 [[ "$ln" =~ ^[0-9]+$ ]] && $c -t mangle -D $chain "$ln" 2>/dev/null || break
@@ -693,7 +912,7 @@ header() {
     echo -e "        ██║     ██║     ██║ ╚═╝ ██║"
     echo -e "        ╚═╝     ╚═╝     ╚═╝     ╚═╝${NC}"
     echo -e "  ${C}──────────────────────────────────────────${NC}"
-    echo -e "  ${B}${C}       PFM - Port Forward Manager v1.8${NC}"
+    echo -e "  ${B}${C}       PFM - Port Forward Manager v1.9${NC}"
     echo -e "  ${GR}            https://t.me/AbrAfagh${NC}"
     echo -e "  ${C}──────────────────────────────────────────${NC}\n"
 }
@@ -806,7 +1025,7 @@ cmd_install() {
         fi
         chmod +x /usr/local/bin/pfm
     fi
-    mkdir -p "$USERS_DIR" "$PORTS_DIR" "$USAGE_DIR" "$MTU_DIR" "$REALM_DIR"
+    mkdir -p "$USERS_DIR" "$PORTS_DIR" "$USAGE_DIR" "$MTU_DIR" "$REALM_DIR" "$HEALTH_DIR"
     touch "$LOG_FILE"
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
     sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null 2>&1
@@ -867,8 +1086,8 @@ EOF
     systemctl enable pfm-restore.service > /dev/null 2>&1
     # cleanup_old dropped the accounting/block rules: bring every existing tunnel back in place
     cmd_restore
-    echo -e "  ${G}PFM v1.8 installed${NC}"
-    log "PFM v1.8 installed"; sleep 1; cmd_menu
+    echo -e "  ${G}PFM v1.9 installed${NC}"
+    log "PFM v1.9 installed"; sleep 1; cmd_menu
 }
 
 cmd_restore() {
@@ -904,15 +1123,18 @@ heal_rules() {
     [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] || {
         sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1; log "HEAL ip_forward was 0"; }
     local f port
+    rules_snapshot
     for f in "$PORTS_DIR"/*; do
         [[ -f "$f" ]] || continue
         port=$(basename "$f")
-        port_rules_present "$port" && continue
         local P_DEST="" P_DPORT="$port" P_METHOD="iptables" P_BLOCKED=0; source "$f"
+        traffic_rules_ok "$port" "$P_DEST" "$P_METHOD" || traffic_rules_apply "$port" "$P_DEST" "$P_METHOD"   # also installs them after an upgrade
+        port_rules_present "$port" && continue
         refresh_port_rules "$port" "$P_DEST" "$P_METHOD" "$P_DPORT"
         [[ "$P_BLOCKED" == "1" && "$P_METHOD" != "haproxy" ]] && block_port "$port"
         log "HEAL $port (rules were missing)"
     done
+    rules_snapshot_end
 }
 
 cmd_sync() {
@@ -926,6 +1148,58 @@ cmd_sync() {
         realm_health_check "$(basename "$f")"
     done
     haproxy_health_check
+    watch_tunnels
+}
+
+# Keeps the counters of the previous sync and writes to the log when a tunnel starts or stops
+# being diverted, or when another tool starts/stops taking its port. Logs only CHANGES.
+# Snapshot file: line 1 "<time> <seen> <got> <verdict> <signature of the foreign rules, 0 = none>",
+# line 2 "<time> <seen> <got>" = the baseline before it
+watch_tunnels() {
+    mkdir -p "$HEALTH_DIR"
+    local f port now ts ps pg pv pf cur seen got v win fl fsig first older last=0
+    now=$(date +%s)
+    [[ -r "$HEALTH_DIR/.last" ]] && read -r last < "$HEALTH_DIR/.last"
+    [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < WATCH_GAP )) && return 0
+    echo "$now" > "$HEALTH_DIR/.last"
+    rules_snapshot
+    for f in "$PORTS_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        port=$(basename "$f")
+        local P_BLOCKED=0 P_METHOD="iptables"; source "$f"
+        [[ "$P_BLOCKED" == "1" ]] && { rm -f "${HEALTH_DIR:?}/${port:?}"; continue; }
+        cur=$(traffic_counters "$port") || continue
+        read -r seen got <<< "$cur"
+        ts=0; ps=0; pg=0; pv=""; pf=0; older=""
+        if [[ -r "$HEALTH_DIR/$port" ]]; then
+            { read -r ts ps pg pv pf; read -r older; } < "$HEALTH_DIR/$port"
+        fi
+        [[ "$pf" =~ ^[0-9]+$ ]] || pf=0
+        read -r v seen got win <<< "$(traffic_verdict "$port")"
+        fl=$(foreign_nat "$port" "$P_METHOD"); fsig=0
+        [[ -n "$fl" ]] && fsig=$(printf '%s\n' "$fl" | cut -f1,3,4 | cksum | cut -d' ' -f1)   # without the packet counter column
+        if [[ "$v" == "diverted" && "$pv" != "diverted" ]]; then
+            log "WARN $port: $seen packets arrived ($(fmt_window "$win")) but only $got reached the tunnel - another NAT rule, rp_filter or a firewall takes the rest (run: pfm doctor $port)"
+        elif [[ "$v" == "ok" && "$pv" == "diverted" ]]; then
+            log "OK $port: traffic reaches the tunnel again"
+        fi
+        if [[ "$fsig" != "0" && "$fsig" != "$pf" ]]; then
+            first=$(printf '%s\n' "$fl" | head -1 | cut -f3,4 | tr '\t' ' ')
+            log "WARN $port: another NAT rule also handles this port and runs before the tunnel: $first (run: pfm doctor $port)"
+        elif [[ "$fsig" == "0" && "$pf" != "0" ]]; then
+            log "OK $port: the other NAT rule that handled this port is gone"
+        fi
+        # keep the baseline a few minutes old: the bot calls `pfm sync` far more often than cron
+        local nts="$ts" nps="$ps" npg="$pg"
+        if ! [[ "$ts" =~ ^[0-9]+$ ]] || (( ts == 0 )); then
+            read -r nps npg <<< "$cur"; nts=$now; older=""
+        elif (( now - ts >= BASELINE_AGE )); then
+            older="$ts $ps $pg"; read -r nps npg <<< "$cur"; nts=$now
+        fi
+        local nv="$pv"; [[ "$v" == "diverted" || "$v" == "ok" ]] && nv="$v"
+        { echo "$nts $nps $npg ${nv:-idle} $fsig"; [[ -n "$older" ]] && echo "$older"; } > "$HEALTH_DIR/$port"
+    done
+    rules_snapshot_end
 }
 
 # ═══════════════ DIAGNOSE ═══════════════
@@ -962,7 +1236,7 @@ tunnel_problems() {
 
 # After an edit: shout when the tunnel does not actually work any more
 edit_report() {
-    local probs; probs=$(tunnel_problems "$1")
+    local probs; probs=$(tunnel_problems "$1"; tunnel_capture_problems "$1")
     [[ -n "$probs" ]] && { echo -e "  ${R}Warning - the tunnel is not working:${NC}\n${R}${probs}${NC}"; sleep 3; }
     return 0
 }
@@ -985,6 +1259,7 @@ cmd_doctor() {
     echo -e "    realm / haproxy   $(realm_installed && echo installed || echo '-') / $(haproxy_installed && echo installed || echo '-')"
     echo -e "\n  ${C}Tunnels${NC}"
     local n=0
+    rules_snapshot
     for f in "$PORTS_DIR"/*; do
         [[ -f "$f" ]] || continue
         port=$(basename "$f"); [[ -n "$only" && "$only" != "$port" ]] && continue
@@ -992,16 +1267,25 @@ cmd_doctor() {
         n=$((n+1))
         echo -e "    ${W}:${port}${NC} -> ${P_DEST}:${P_DPORT} [${P_METHOD}]"
         if [[ "$P_BLOCKED" == "1" ]]; then echo -e "      ${Y}blocked (limit reached or disabled)${NC}"; continue; fi
-        local probs; probs=$(tunnel_problems "$port")
-        if [[ -n "$probs" ]]; then nbad=$((nbad+1)); while IFS= read -r line; do echo -e "    ${R}${line}${NC}"; done <<< "$probs"
+        local p_in p_out bad=0; p_in=$(tunnel_problems "$port"); p_out=$(tunnel_capture_problems "$port")
+        if [[ -n "$p_in" ]]; then bad=1; while IFS= read -r line; do echo -e "    ${R}${line}${NC}"; done <<< "$p_in"
         else echo -e "      ${G}✓ listening / rules in place${NC}"; fi
+        if [[ -n "$p_out" ]]; then bad=1; while IFS= read -r line; do echo -e "    ${R}${line}${NC}"; done <<< "$p_out"; fi
+        local tv tseen tgot twin
+        read -r tv tseen tgot twin <<< "$(traffic_verdict "$port")"
+        case "$tv" in
+            ok)   echo -e "      ${G}✓ traffic from outside reaches the tunnel${NC} ${GR}($tseen packets arrived, $tgot handed over, $(fmt_window "$twin"))${NC}" ;;
+            idle) echo -e "      ${GR}- no traffic from outside seen yet ($(fmt_window "$twin")): connect from a client, then run this again${NC}" ;;
+        esac
+        nbad=$((nbad + bad))
         if dest_reachable "$P_DEST" "$P_DPORT"; then echo -e "      ${G}✓ destination ${P_DEST}:${P_DPORT} reachable (TCP) from this server${NC}"
         else echo -e "      ${Y}! destination ${P_DEST}:${P_DPORT} NOT reachable over TCP from this server${NC}"
              echo -e "        ${GR}wrong IP/port, destination down or blocking this server, or a UDP-only service${NC}"; fi
     done
+    rules_snapshot_end
     [[ $n -eq 0 ]] && echo -e "    ${GR}No tunnels.${NC}"
     echo ""
-    [[ $nbad -eq 0 ]] && echo -e "  ${G}No problem found.${NC}" || echo -e "  ${R}${nbad} tunnel(s) with problems.${NC}  ${GR}Try: pfm restore${NC}"
+    [[ $nbad -eq 0 ]] && echo -e "  ${G}No problem found.${NC}" || echo -e "  ${R}${nbad} tunnel(s) with problems.${NC}  ${GR}Try: pfm restore  (a foreign NAT rule listed above must be removed by you)${NC}"
     return $((nbad > 0))
 }
 
@@ -1060,6 +1344,15 @@ menu_add() {
             echo -e "  ${GR}Choose another port or stop that service first.${NC}"; sleep 3; return
         fi
         echo -ne "  ${Y}'${occ}' listens on port $port; the forward would take over its external traffic. Continue? (y/N):${NC} "
+        read -r yn; [[ "$yn" != "y" && "$yn" != "Y" ]] && return
+    fi
+    # A port that is only DNAT-ed by another tool (other tunnel managers, Docker, firewalld...) has no
+    # listener, so the check above calls it free - yet that rule takes the traffic before this tunnel.
+    local other; other=$(foreign_report "$port" "$method")
+    if [[ -n "$other" ]]; then
+        echo -e "\n${Y}${other//✗/!}${NC}"
+        echo -e "  ${GR}The new tunnel would look fine but receive nothing while that rule exists.${NC}"
+        echo -ne "  ${Y}Add the tunnel anyway? (y/N):${NC} "
         read -r yn; [[ "$yn" != "y" && "$yn" != "Y" ]] && return
     fi
     echo -ne "  ${C}Destination IP:${NC} "; read -r dest
