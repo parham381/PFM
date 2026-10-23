@@ -221,7 +221,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
 - **BBR** فقط روی اتصال‌هایی اثر دارد که خود سرور تمامشان می‌کند (Realm / HAProxy)؛ ترافیکِ NAT‌شده با iptables فقط عبور می‌کند.
 - اگر Realm/HAProxy پروفایلی را قبول نکند، تغییر **خودکار برگردانده می‌شود** و تانل هرگز خاموش نمی‌ماند.
 
-**ایمنی:** هر تغییر قبل از اعمال با دلیلش نشان داده می‌شود، مقدار اصلی ذخیره می‌شود، بعد از ریبوت دوباره اعمال می‌شود (`pfm restore`)، اگر چیزی (مثلاً `sysctl -p`) آن را بهم بزند `pfm sync` درستش می‌کند و از «وضعیت و برگشت» همه‌چیز برمی‌گردد. خط فرمان: `pfm optimize [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]`.
+**ایمنی:** هر تغییر قبل از اعمال با دلیلش نشان داده می‌شود، مقدار اصلی ذخیره می‌شود، بعد از ریبوت دوباره اعمال می‌شود (`pfm restore`)، اگر چیزی (مثلاً `sysctl -p`) آن را بهم بزند `pfm sync` درستش می‌کند و از «وضعیت و برگشت» همه‌چیز برمی‌گردد. **محدودیت شناخته‌شده:** پروفایل/MTU هر تانل با یک مسیر میزبان (`/32`) اعمال می‌شود که next-hop مسیر اصلی را کپی می‌کند؛ اگر گیت‌وی پیش‌فرض عوض شود، `pfm sync` (حداکثر تا حدود ۵ دقیقه) آن را بازسازی می‌کند و تا آن موقع تانلِ تنظیم‌شده ممکن است کار نکند (تانل‌های تنظیم‌نشده تأثیری نمی‌بینند). خط فرمان: `pfm optimize [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]`.
 
 ### 🔁 سوییچ بین نسخه‌ها
 
@@ -496,7 +496,7 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
 - **BBR** only acts on connections the server itself terminates (Realm / HAProxy); connections NAT-ed by iptables are just passed along.
 - If Realm / HAProxy rejects a profile the change is **rolled back automatically** - a tunnel is never left dead.
 
-**Safety:** every change is shown with its reason before it is applied, the original value is stored, it is re-applied after reboot (`pfm restore`), `pfm sync` repairs it if something (e.g. `sysctl -p`) undoes it, and *Status & revert* restores everything. CLI: `pfm optimize [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]`.
+**Safety:** every change is shown with its reason before it is applied, the original value is stored, it is re-applied after reboot (`pfm restore`), `pfm sync` repairs it if something (e.g. `sysctl -p`) undoes it, and *Status & revert* restores everything. **Known limit:** a tunnel's profile / MTU is applied through a host route (`/32`) that copies the next hop of the route it shadows; after a default-gateway change `pfm sync` rebuilds it within about 5 minutes, and until then the tuned tunnel can be unreachable (untuned tunnels are not affected). CLI: `pfm optimize [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]`.
 
 ## 🔁 Versions & Update
 

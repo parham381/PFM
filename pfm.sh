@@ -16,6 +16,8 @@
 
 # cron runs with PATH=/usr/bin:/bin, where iptables, ethtool, tc and sysctl (sbin) are not found: add the standard directories behind whatever is there
 for _d in /usr/local/sbin /usr/local/bin /usr/sbin /sbin; do case ":$PATH:" in *":$_d:"*) ;; *) PATH="${PATH:+$PATH:}$_d" ;; esac; done; export PATH; unset _d
+# numbers are always read and written the C way ("0.041", never "0,04"): Debian / Ubuntu mawk follows the locale of the caller, and a decimal-comma locale turned 61.3 ms into 61
+awk() { LC_ALL='' LC_NUMERIC=C command awk "$@"; }
 
 PFM_DIR="/etc/pfm"
 USERS_DIR="$PFM_DIR/users"
@@ -101,7 +103,6 @@ valid_gb() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; }
 # Port/user files are `source`d as root: refuse anything the shell would interpret
 safe_text() { local bad='["$`\\]'; [[ -n "$1" && ! "$1" =~ $bad && "$1" != *$'\n'* ]]; }
 
-# @@CHUNK helpers@@
 # ═══════════════ HELPERS (v2.0) ═══════════════
 confirm() {    # confirm "question" [y|n default] -> 0 = yes
     local q="$1" d="${2:-n}" a hint="(y/N)"
@@ -181,7 +182,6 @@ sys_path() { echo "$SYSCTL_ROOT/${1//./\/}"; }
 sys_has() { [[ -e "$(sys_path "$1")" ]]; }
 sys_get() { local p; p=$(sys_path "$1"); [[ -r "$p" ]] && tr '\t' ' ' < "$p" | tr -s ' ' | sed 's/ *$//'; }
 sys_set() { local p; p=$(sys_path "$1"); [[ -e "$p" ]] || return 1; { printf '%s\n' "$2" > "$p"; } 2> /dev/null || return 2; }      # (braces: a refusal must not print bash's own redirection error)
-# @@END helpers@@
 
 # Name of the process that listens on a TCP port ("" = free, or ss is not installed)
 port_owner() { command -v ss > /dev/null 2>&1 && ss -ltnp "sport = :$1" 2>/dev/null | grep -o 'users:((".*' | head -1; }
@@ -391,7 +391,7 @@ traffic_rules_remove() {
 sum_tag_pkts() {
     awk -v T="--comment $1 " '
         /^\[[0-9]+:[0-9]+\] -A / { l = $0 " "; if (index(l, T) == 0) next
-            c = $1; gsub(/[\[\]]/, "", c); split(c, a, ":"); s += a[1]; b += a[2]; n++ }
+            c = $1; sub(/^\[/, "", c); sub(/\]$/, "", c); split(c, a, ":"); s += a[1]; b += a[2]; n++ }
         END { print n + 0, s + 0, b + 0 }'
 }
 # Are all count-only rules of the tunnel in place? (tcp+udp, haproxy: tcp only)
@@ -992,7 +992,7 @@ remove_all_mtu() {
 
 # ═══════════════ CLEANUP ═══════════════
 cleanup_old() {
-    ip -4 route flush proto "$PFM_ROUTE_PROTO" 2> /dev/null; ip -6 route flush proto "$PFM_ROUTE_PROTO" 2> /dev/null
+    tune_routes_flush                                  # the assistant's host routes only (not every route that happens to carry the protocol number)
     local c; for c in iptables ip6tables; do
         $c -D FORWARD -j PFM_ACCOUNT 2>/dev/null || true
         $c -D FORWARD -j PFM_FORWARD 2>/dev/null || true
@@ -1002,18 +1002,18 @@ cleanup_old() {
         $c -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
         local chain
         for chain in FORWARD INPUT OUTPUT; do
-            while $c -L $chain --line-numbers -n 2>/dev/null | grep -q "pfm_"; do
-                local ln=$($c -L $chain --line-numbers -n 2>/dev/null | grep "pfm_" | head -1 | awk '{print $1}')
+            while $c -L $chain --line-numbers -n 2>/dev/null | grep -v "pfm_bench_" | grep -q "pfm_"; do
+                local ln=$($c -L $chain --line-numbers -n 2>/dev/null | grep "pfm_" | grep -v "pfm_bench_" | head -1 | awk '{print $1}')
                 [[ "$ln" =~ ^[0-9]+$ ]] && $c -D $chain "$ln" 2>/dev/null || break
             done; done
         local t; for t in "nat PREROUTING" "nat POSTROUTING"; do
-            while $c -t ${t% *} -L ${t#* } --line-numbers -n 2>/dev/null | grep -q "pfm_"; do
-                local ln=$($c -t ${t% *} -L ${t#* } --line-numbers -n 2>/dev/null | grep "pfm_" | head -1 | awk '{print $1}')
+            while $c -t ${t% *} -L ${t#* } --line-numbers -n 2>/dev/null | grep -v "pfm_bench_" | grep -q "pfm_"; do
+                local ln=$($c -t ${t% *} -L ${t#* } --line-numbers -n 2>/dev/null | grep "pfm_" | grep -v "pfm_bench_" | head -1 | awk '{print $1}')
                 [[ "$ln" =~ ^[0-9]+$ ]] && $c -t ${t% *} -D ${t#* } "$ln" 2>/dev/null || break
             done; done
         for chain in PREROUTING INPUT FORWARD OUTPUT; do
-            while $c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep -q "pfm_"; do
-                local ln=$($c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep "pfm_" | head -1 | awk '{print $1}')
+            while $c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep -v "pfm_bench_" | grep -q "pfm_"; do
+                local ln=$($c -t mangle -L $chain --line-numbers -n 2>/dev/null | grep "pfm_" | grep -v "pfm_bench_" | head -1 | awk '{print $1}')
                 [[ "$ln" =~ ^[0-9]+$ ]] && $c -t mangle -D $chain "$ln" 2>/dev/null || break
             done; done
     done
@@ -1414,7 +1414,6 @@ cmd_doctor() {
     return $((nbad > 0))
 }
 
-# @@CHUNK probes@@
 # ═══════════════ NETWORK PROBES (Bench Test + Optimization Assistant) ═══════════════
 # Probes print "key=value" pairs on one line (nothing / err= on failure), so callers never need eval.
 kvget() { local t; for t in $1; do [[ "${t%%=*}" == "$2" ]] && { echo "${t#*=}"; return 0; }; done; return 1; }
@@ -1722,8 +1721,6 @@ conn_count() {    # tracked connections whose original destination port is <port
     elif command -v ss > /dev/null 2>&1; then ss -Htn state established "( sport = :$1 )" 2> /dev/null | wc -l
     else echo 0; fi
 }
-# @@END probes@@
-# @@CHUNK bench@@
 # ═══════════════ BENCH TEST ═══════════════
 # What can be measured honestly from this server: the leg server -> destination (latency, jitter, loss, MTU,
 # route), what the engine adds on top, how the host copes, and the traffic that really flows right now.
@@ -2560,14 +2557,17 @@ cmd_bench_server() {
     bench_server_cleanup; trap - INT TERM HUP
     echo -e "\n  ${GR}Helper stopped.${NC}"
 }
-bench_peer_help() {    # shown when the helper is not reachable
+bench_peer_help() {    # shown when the helper is not reachable (the addresses are hidden while mask mode is on)
     local src; src=$(bget r_src)
-    echo -e "\n  ${Y}The speed-test helper is not reachable on $(bget ip):${1}.${NC}"
-    echo -e "  ${GR}A tunnel can only be speed-tested together with the other end. On the DESTINATION server run (as root):${NC}\n"
-    echo -e "    ${W}bash <(curl -sL ${PFM_REPO_RAW}/pfm.sh) bench-server ${1} ${src:-}${NC}\n"
-    echo -e "  ${GR}It installs iperf3 if needed, accepts only ${src:-your IP}, and stops by itself after 15 minutes.${NC}"
-    echo -e "  ${GR}(If this server sits behind NAT, give the public IP it appears from instead of ${src:-that address}.)${NC}"
-    echo -e "  ${GR}Needs TCP and UDP ${1} reachable from ${src:-here} (cloud firewall / security group too).${NC}"
+    {
+        echo -e "\n  ${Y}The speed-test helper is not reachable on $(bget ip):${1}.${NC}"
+        echo -e "  ${GR}A tunnel can only be speed-tested together with the other end. On the DESTINATION server run (as root):${NC}\n"
+        echo -e "    ${W}bash <(curl -sL ${PFM_REPO_RAW}/pfm.sh) bench-server ${1} ${src:-}${NC}\n"
+        echo -e "  ${GR}It installs iperf3 if needed, accepts only ${src:-your IP}, and stops by itself after 15 minutes.${NC}"
+        echo -e "  ${GR}(If this server sits behind NAT, give the public IP it appears from instead of ${src:-that address}.)${NC}"
+        echo -e "  ${GR}Needs TCP and UDP ${1} reachable from ${src:-here} (cloud firewall / security group too).${NC}"
+        (( BN_MASK )) && echo -e "  ${GR}(Addresses are hidden because of --mask; without it the command shows the real IP to copy.)${NC}"
+    } | bn_out
 }
 
 # ── menu + CLI ──
@@ -2668,8 +2668,6 @@ cmd_bench() {    # pfm bench <port> [quick|full] [--peer PORT] [--inet] [--yes] 
     echo; { bench_report_summary; echo; bench_report_details; } | bn_out
     echo -e "\n  ${GR}Saved: ${BN_REPORT_FILE}${NC}"
 }
-# @@END bench@@
-# @@CHUNK assist@@
 # ═══════════════ OPTIMIZATION ASSISTANT ═══════════════
 # Every change is recorded (original value first), applied live, persisted, re-applied by `pfm restore`/`pfm sync`
 # and can be reverted. Nothing is touched without showing what and why.
@@ -2886,13 +2884,13 @@ cpu_mask_hex() {    # n CPUs -> kernel cpumask: 32-bit hex groups, most signific
     for (( i = ${#parts[@]} - 1; i >= 0; i-- )); do out+="${parts[i]},"; done
     echo "${out%,}"
 }
-nic_feature() { ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f { sub(/ .*/, "", $2); print $2; exit }'; }
-nic_feature_fixed() { ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f && /\[fixed\]/ { r = 1 } END { exit !r }'; }
-nic_root_qdisc() { tc qdisc show dev "$1" root 2> /dev/null | awk 'NR == 1 { print $2 }'; }
+nic_feature() { timeout 10 ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f { sub(/ .*/, "", $2); print $2; exit }'; }
+nic_feature_fixed() { timeout 10 ethtool -k "$1" 2> /dev/null | awk -F': ' -v f="$2" '$1 == f && /\[fixed\]/ { r = 1 } END { exit !r }'; }
+nic_root_qdisc() { timeout 10 tc qdisc show dev "$1" root 2> /dev/null | awk 'NR == 1 { print $2 }'; }
 nic_qdisc_targets() {    # the queues of <dev> that are the kernel's plain default and would become fq, one "<target> <kind>" per line: "root pfifo_fast" / ":3 pfifo_fast".
     local dev="$1" all root              # Anything somebody configured (fq_codel, cake, htb, netem, tbf ...) and virtual noqueue devices are left alone.
     command -v tc > /dev/null 2>&1 || return 0
-    all=$(tc qdisc show dev "$dev" 2> /dev/null) || return 0
+    all=$(timeout 10 tc qdisc show dev "$dev" 2> /dev/null) || return 0
     root=$(awk '/ root( |$)/ { print $2; exit }' <<< "$all")
     case "$root" in
         pfifo_fast|pfifo) echo "root $root" ;;
@@ -2917,13 +2915,13 @@ nic_set_qdisc() {    # make the kernel-default queue of <dev> fq (BBR's partner)
 }
 
 nic_ring() {    # nic_ring <dev> -> "<max rx> <max tx> <current rx> <current tx>" (zeros when the driver has no ring settings)
-    ethtool -g "$1" 2> /dev/null | awk '/^Pre-set maximums/ { s = 1 } /^Current hardware/ { s = 2 } /^RX:/ { if (s == 1) rm = $2; if (s == 2) rc = $2 } /^TX:/ { if (s == 1) tm = $2; if (s == 2) tc = $2 } END { print rm + 0, tm + 0, rc + 0, tc + 0 }'
+    timeout 10 ethtool -g "$1" 2> /dev/null | awk '/^Pre-set maximums/ { s = 1 } /^Current hardware/ { s = 2 } /^RX:/ { if (s == 1) rm = $2; if (s == 2) rc = $2 } /^TX:/ { if (s == 1) tm = $2; if (s == 2) tc = $2 } END { print rm + 0, tm + 0, rc + 0, tc + 0 }'
 }
 nic_norm_mask() { local m="${1//,/}"; m="${m,,}"; m="${m#"${m%%[!0]*}"}"; echo "${m:-0}"; }      # the kernel pads a cpumask with zeros, we store it without
 nic_wanted_features() { printf '%s\n' "generic-receive-offload gro on" "generic-segmentation-offload gso on" "tcp-segmentation-offload tso on" "large-receive-offload lro off"; }
 nic_scan() {    # nic_scan <dev> -> one-line facts
     local dev="$1" drv speed rxq cpus drops
-    drv=$(ethtool -i "$dev" 2> /dev/null | awk '/^driver:/ { print $2 }')
+    drv=$(timeout 10 ethtool -i "$dev" 2> /dev/null | awk '/^driver:/ { print $2 }')
     speed=$(cat "$SYSFS_NET/$dev/speed" 2> /dev/null); [[ "$speed" =~ ^[0-9]+$ ]] || speed=0
     rxq=$(nic_rxq "$dev"); cpus=$(nproc 2> /dev/null || echo 1)
     drops=$(( $(cat "$SYSFS_NET/$dev/statistics/rx_dropped" 2> /dev/null || echo 0) + $(cat "$SYSFS_NET/$dev/statistics/rx_missed_errors" 2> /dev/null || echo 0) ))
@@ -2998,10 +2996,10 @@ nic_restore() {    # boot / heal: put the stored card settings back (only what i
                       [[ "$(nic_norm_mask "$(cat "$q/rps_cpus" 2> /dev/null)")" == "$(nic_norm_mask "$v")" ]] || echo "$v" > "$q/rps_cpus" 2> /dev/null
                   done ;;
             off)  command -v ethtool > /dev/null 2>&1 || continue
-                  [[ "$(nic_feature "$dev" "$(nic_feat_name "$what")")" == "$v" ]] || ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 ;;
+                  [[ "$(nic_feature "$dev" "$(nic_feat_name "$what")")" == "$v" ]] || timeout 20 ethtool -K "$dev" "$what" "$v" > /dev/null 2>&1 ;;
             ring) command -v ethtool > /dev/null 2>&1 || continue
                   read -r _ _ rcur tcur <<< "$(nic_ring "$dev")"
-                  [[ "$rcur $tcur" == "$v" ]] || ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 ;;
+                  [[ "$rcur $tcur" == "$v" ]] || timeout 20 ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 ;;
             qdisc) nic_set_qdisc "$dev" ;;
         esac
     done < "$TUNE_DIR/nic.conf"
@@ -3038,7 +3036,7 @@ nic_revert() {
             ring) ethtool -G "$dev" rx "${v%% *}" tx "${v##* }" > /dev/null 2>&1 && n=$((n + 1)) ;;
             qdisc) read -r qk qv <<< "$v"; [[ -n "$qv" ]] || { qv="$qk"; qk=root; }           # "<root|mq> <qdisc>"; only a queue that still is OUR fq is put back
                    if [[ "$qk" == mq ]]; then
-                       for t in $(tc qdisc show dev "$dev" 2> /dev/null | awk '$2 == "fq" { for (i = 1; i < NF; i++) if ($i == "parent") print $(i + 1) }'); do
+                       for t in $(timeout 10 tc qdisc show dev "$dev" 2> /dev/null | awk '$2 == "fq" { for (i = 1; i < NF; i++) if ($i == "parent") print $(i + 1) }'); do
                            tc qdisc replace dev "$dev" parent "$t" "$qv" 2> /dev/null && n=$((n + 1))
                        done
                    elif [[ "$(nic_root_qdisc "$dev")" == fq ]]; then tc qdisc replace dev "$dev" root "$qv" 2> /dev/null && n=$((n + 1)); fi ;;
@@ -3130,7 +3128,7 @@ tune_port_table() {    # one line per tunnel, read in ONE pass over the port fil
 }
 tune_port_tuned() {    # does this tunnel carry a profile / pinned MTU? (read without starting a process)
     local l
-    while IFS= read -r l; do [[ "$l" =~ $TUNE_CFG_RE ]] && return 0; done < "$PORTS_DIR/$1" 2> /dev/null
+    { while IFS= read -r l; do [[ "$l" =~ $TUNE_CFG_RE ]] && return 0; done < "$PORTS_DIR/$1"; } 2> /dev/null
     return 1
 }
 
@@ -3142,7 +3140,7 @@ tune_dest_ip() {    # destination of a tunnel as an IP. A name is looked up at m
     printf -v now '%(%s)T' -1 2> /dev/null; [[ "$now" =~ ^[0-9]{9,}$ ]] || now=$(date +%s)         # (bash older than 4.3 prints -1 for "now")
     if [[ -r "$f" ]]; then read -r t ip < "$f"; [[ "$t" =~ ^[0-9]+$ ]] && (( now - t < 60 )) && { echo "$ip"; return 0; }; fi
     ip=$(timeout 3 getent ahosts "$h" 2> /dev/null | awk '{ print $1; exit }')
-    mkdir -p "$TUNE_DIR/ipcache" 2> /dev/null && echo "$now $ip" > "$f" 2> /dev/null
+    mkdir -p "$TUNE_DIR/ipcache" 2> /dev/null && { echo "$now $ip" > "$f"; } 2> /dev/null
     echo "$ip"
 }
 tune_ip_forget() { [[ -n "$1" ]] && rm -f "$TUNE_DIR/ipcache/${1//[^A-Za-z0-9._-]/_}"; return 0; }       # an interactive action wants the answer of NOW (the lookup may have failed a moment ago)
@@ -3200,7 +3198,7 @@ tune_route_note() {    # tells why the route part of a change could not be appli
         2) echo -e "  ${Y}Note: the kernel refused the route settings (container or restricted host); the other parts were applied.${NC}" ;;
     esac
 }
-tune_mss_listed() { local l; while read -r l; do [[ "$l" == "$1" ]] && return 0; done < "$TUNE_DIR/mss.ports" 2> /dev/null; return 1; }
+tune_mss_listed() { local l; { while read -r l; do [[ "$l" == "$1" ]] && return 0; done < "$TUNE_DIR/mss.ports"; } 2> /dev/null; return 1; }
 tune_mss_mark() {    # tune_mss_mark add|del <port>: mss.ports lists the tunnels that have MSS rules, so the others never pay for a look at the firewall
     local t
     if [[ "$1" == add ]]; then tune_mss_listed "$2" || echo "$2" >> "$TUNE_DIR/mss.ports"
@@ -3549,6 +3547,9 @@ dns_heal() {    # a DHCP client or cloud-init may rewrite a plain resolv.conf: p
     local want first r; want=$(kv_get "$TUNE_DIR/dns.conf" servers); first=$(awk '/^nameserver/ { print $2; exit }' "$RESOLV_CONF" 2> /dev/null)
     [[ "$first" == "${want%% *}" ]] && return 0
     [[ -L "$RESOLV_CONF" ]] && return 0
+    # only a rewrite that brings the ORIGINAL first resolver back (DHCP, cloud-init) is undone; a resolver the admin chose by hand is his
+    local orig_first; orig_first=$(awk '/^nameserver/ { print $2; exit }' "$TUNE_DIR/dns.orig/resolv.conf" 2> /dev/null)
+    [[ -n "$orig_first" && "$first" != "$orig_first" ]] && return 0
     if command -v dig > /dev/null 2>&1; then
         r=$(dns_query "${want%% *}" github.com); [[ "${r%% *}" == TIMEOUT ]] && { log "HEAL dns skipped: ${want%% *} does not answer (the system's own resolver stays)"; return 0; }
     fi
@@ -3719,7 +3720,15 @@ assist_status() {
         tail -n 12 "$TUNE_DIR/history.log" | while IFS='|' read -r ts area what; do printf "   ${GR}%s${NC}  %-8s %s\n" "$(date -d "@$ts" '+%m-%d %H:%M' 2> /dev/null)" "$area" "$what"; done
     else echo -e "   ${GR}none${NC}"; fi
 }
-tune_routes_flush() { local fam; for fam in -4 -6; do ip $fam route flush proto "$PFM_ROUTE_PROTO" 2> /dev/null; done; return 0; }      # every route the assistant ever made carries this protocol number
+tune_routes_flush() {    # every route the assistant ever made is a host route (a bare address) with this protocol number; whatever else somebody tagged with it stays
+    local fam r
+    for fam in -4 -6; do
+        while read -r r _; do
+            [[ -n "$r" && "$r" != */* ]] && ip $fam route del "$r" proto "$PFM_ROUTE_PROTO" 2> /dev/null
+        done < <(ip $fam route show proto "$PFM_ROUTE_PROTO" 2> /dev/null)
+    done
+    return 0
+}
 tune_revert_all() {    # tune_revert_all [quiet]
     local q="${1:-}" f dev n port m d dp
     n=$(tune_sysctl_revert); n=$(( n + $(tune_misc_revert) )); [[ -z "$q" ]] && echo -e "   kernel settings restored: $n"
@@ -3782,7 +3791,7 @@ tune_routes_refresh() {    # a host route copies the next hop / source address o
     (( unresolved )) && return 0
     local r
     while read -r r _; do
-        [[ -n "$r" ]] || continue
+        [[ -n "$r" && "$r" != */* ]] || continue                 # only a host route (a bare address) can be one of ours
         [[ "$done_ips" == *" ${r%/*} "* ]] || ip -4 route del "$r" proto "$PFM_ROUTE_PROTO" 2> /dev/null
     done < <(ip -4 route show proto "$PFM_ROUTE_PROTO" 2> /dev/null)
     return 0
@@ -3896,8 +3905,6 @@ cmd_optimize() {    # pfm optimize [quick|scan|status|revert|dns|mtu <port>|prof
         *) echo "usage: pfm optimize [quick|scan|status|revert|dns|bbr|nic|mtu <port>|profile <port> gaming|bandwidth|balanced|multiuser]"; return 1 ;;
     esac
 }
-# @@END assist@@
-# @@CHUNK versions@@
 # ═══════════════ INSTALL, SHORTCUTS & VERSIONS (v2.0) ═══════════════
 # Every release published on GitHub can be installed from the panel. The program that gets replaced is always kept
 # (with a copy of the tunnel list), so a bad update is one key away from being undone - even without internet.
@@ -4231,6 +4238,8 @@ switch_to_file() {    # switch_to_file <pfm.sh> <label> -> 0 = installed and eve
     else echo -e "  ${Y}!${NC} v${new} is in place, but its installer reported an error (shown above): cron / services may not be up to date"; fi
     log "SWITCH v$cur -> v$new ($label)"
     (( keep == 0 )) && { tune_revert_all quiet > /dev/null 2>&1; echo -e "  ${G}✔${NC} assistant settings reverted"; }
+    # the per-destination route attributes of the profiles go stale without the refresh that only v2.0 does (a gateway change would strand the tunnel): they come back when v2.0 does
+    [[ "$(ver_cmp "$new" 2.0)" == -1 ]] && (( keep )) && tune_routes_flush
     sleep 2                                                      # realm / haproxy need a moment to bind
     probs=$(versions_verify); bad=$?
     prune_backups "$bk" "$f"
@@ -4384,7 +4393,6 @@ cmd_versions() {    # pfm versions | switch <tag> | update | rollback | version 
         rollback) check_root; rollback_version ;;
     esac
 }
-# @@END versions@@
 
 # ═══════════════ MENU ═══════════════
 cmd_menu() {
