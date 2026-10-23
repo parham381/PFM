@@ -95,11 +95,11 @@ bash <(curl -sL https://raw.githubusercontent.com/parham381/PFM/main/pfm.sh) ben
 
 </div>
 
-iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصال می‌دهد و بعد از ۱۵ دقیقه (قابل تنظیم، ۱ تا ۱۲۰) خودش خاموش می‌شود و قوانین فایروالِ موقت را پاک می‌کند. **محدودیت IP قبل از شروع در فایروال بررسی می‌شود**؛ اگر نشد، Helper راه نمی‌افتد (باز گذاشتن پورت برای همه فقط با اجرای بدون IP). پورتی که سرویس دیگری (TCP یا UDP، مثلاً WireGuard) استفاده می‌کند رد می‌شود، و قوانین به‌جامانده از Helperای که با `kill -9` متوقف شده در اجرای بعدی پاک می‌شوند. بدون Helper، تست کامل فقط بخش سرعت را رد می‌کند؛ سنجش سرعت خود سرور به اینترنت (دانلود تا ۱۰۰ مگابایت از Cloudflare) فقط با `--inet` یا پاسخ y در منو انجام می‌شود. اگر همین الان کاربرانی از تانل استفاده می‌کنند، قبل از تست سرعت هشدار می‌دهد و تأیید می‌گیرد (تست سرعت تا حدود ۴ گیگابایت ترافیک روی خط ۱ گیگابیتی مصرف می‌کند).
+iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصال می‌دهد و بعد از ۱۵ دقیقه (قابل تنظیم، ۱ تا ۱۲۰) خودش خاموش می‌شود و قوانین فایروالِ موقت را پاک می‌کند. **محدودیت IP قبل از شروع در فایروال بررسی می‌شود**؛ اگر نشد، Helper راه نمی‌افتد (باز گذاشتن پورت برای همه فقط با اجرای بدون IP). پورتی که سرویس دیگری (TCP یا UDP، مثلاً WireGuard) استفاده می‌کند رد می‌شود، و قوانین به‌جامانده از Helperای که با `kill -9` متوقف شده در اجرای بعدی پاک می‌شوند (تا وقتی iperf3 آن هنوز روی پورت گوش می‌دهد قوانین می‌مانند تا پورت باز نشود)؛ یک تایمر مستقل هم قوانین را سر موعد برمی‌دارد. بدون Helper، تست کامل فقط بخش سرعت را رد می‌کند؛ سنجش سرعت خود سرور به اینترنت (دانلود تا ۱۰۰ مگابایت از Cloudflare) فقط با `--inet` یا پاسخ y در منو انجام می‌شود. اگر همین الان کاربرانی از تانل استفاده می‌کنند، قبل از تست سرعت هشدار می‌دهد و تأیید می‌گیرد؛ پاسخ پیش‌فرض «نه» است (تست سرعت تا حدود ۴ گیگابایت ترافیک روی خط ۱ گیگابیتی مصرف می‌کند). گزینه‌های `--peer` و `--inet` یعنی تست کامل.
 
 **خروجی** (برای اسکرین‌شات طراحی شده، کمتر از ۹۰ ستون):
 
-- نمرهٔ ۰ تا ۱۰۰ و درجهٔ A تا F — هر مشکل جدی (پکت‌لاس، جیتر، Bufferbloat، MTU black hole) سقف نمره را پایین می‌آورد. **تعداد پکت‌های گمشده مهم است نه فقط درصد**: یک پینگ گمشده از ۴۰ تا (۲٫۵٪) الگو حساب نمی‌شود و نمره را نمی‌شکند؛ حداقل ۳ پکت یا دو رویداد جدا لازم است. اگر هیچ پینگی زیر بار برنگردد، نتیجه «بد» است، نه «تأخیر ثابت»؛ اگر هیچ چیز جواب ندهد (مثلاً سرویس فقط UDP) «قابل اندازه‌گیری نیست» نشان داده می‌شود، نه ۰ از ۱۰۰. تانل بلاک‌شده یا خاموش اول از همه گزارش می‌شود
+- نمرهٔ ۰ تا ۱۰۰ و درجهٔ A تا F — هر مشکل جدی (پکت‌لاس، جیتر، Bufferbloat، MTU black hole) سقف نمره را پایین می‌آورد. **تعداد پکت‌های گمشده مهم است نه فقط درصد**: یک پینگ گمشده از ۴۰ تا (۲٫۵٪) الگو حساب نمی‌شود و نمره را نمی‌شکند؛ حداقل ۳ پکت گمشده لازم است. اگر هیچ پینگی زیر بار برنگردد (یا ≥۳۰٪ آن‌ها گم شوند)، نتیجه «بد» است، نه «تأخیر ثابت»؛ اتصال‌های TCP ناموفق به پورت سرویس با وجود پینگِ سالم هم یافتهٔ جدا و سقف نمره دارد؛ اگر هیچ چیز جواب ندهد (مثلاً سرویس فقط UDP) «قابل اندازه‌گیری نیست» نشان داده می‌شود، نه ۰ از ۱۰۰. تانل بلاک‌شده یا خاموش اول از همه گزارش می‌شود
 - وضعیت تانل برای هر نوع استفاده: گیمینگ، استریم/دانلود، تماس صوتی/تصویری، استفادهٔ روزمره (در تست سریع «استریم/دانلود» **n/a** است چون سرعت اندازه نمی‌گیرد). گزارش صریح می‌گوید فقط بخش «سرور ← مقصد» را پوشش می‌دهد
 - جدول اعداد، نمودار پایداری و «یافته‌ها» به زبان ساده
 - **قدم‌های بعدی**: هر پیشنهاد مستقیماً به دستیار بهینه‌سازی وصل است — شمارهٔ آن را بزنید تا همان‌جا اجرا شود، سپس با `r` دوباره تست کنید. گزارش جدید فرق با تست قبلی و کارهایی که دستیار در این فاصله انجام داده را نشان می‌دهد
@@ -115,9 +115,12 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
 ```
   PFM BENCH TEST  PFM v2.0 · 2026-10-18 21:40 · full · 178s
   ────────────────────────────────────────────────────────────────────────────
-  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced · owner ali
-  Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel 5.15.0-125-generic
-  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc pfifo_fast
+  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced ·
+          owner ali
+  Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel
+          5.15.0-125-generic
+  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc
+          pfifo_fast
   ────────────────────────────────────────────────────────────────────────────
   OVERALL  ████████████████░░░░  83/100  Grade B
   covers the server → destination leg only
@@ -136,7 +139,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
    Upload       377.9 Mbit/s (4 streams)  ·  retransmits 88       
    UDP 1 Mbit/s loss 0.12%  jitter 2.1 ms (200-byte packets)       
    Under load   +61 ms (worst ping: idle 70, down 131, up 97 ms)   ● FAIR
-   Engine       realm = 96% of direct speed, engine CPU 38%, busiest core 41% 
+   Engine       realm 398.0 Mbit/s = 96% of direct 412.6 Mbit/s, its CPU 38% 
    Live now     down 3.1 / up 0.4 Mbit/s, 9 connections            
   ────────────────────────────────────────────────────────────────────────────
   FINDINGS
@@ -170,13 +173,19 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
    Loss on middle hops only (not at the last hop) is ICMP rate-limiting.
   ────────────────────────────────────────────────────────────────────────────
   RAW NUMBERS
-   ICMP   sent 300 recv 299 · min 58.9 avg 61.3 p50 - p95 69.8 max 143.2 ms · stdev - · loss events 0
-   TCP    10/10 ok · min - avg 61.9 max - ms · kernel: mss 1448 pmtu - rtt 60.5 ms cwnd - cc -
-   MTU    interface 1500 · path 1420 · router frag-needed message: no · tunnel overhead 0 B
+   ICMP   sent 300 recv 299 · min 58.9 avg 61.3 p50 - p95 69.8 max 143.2 ms
+          · stdev - · loss events 0
+   TCP    10/10 ok · min - avg 61.9 max - ms · kernel: mss 1448 pmtu - rtt
+          60.5 ms cwnd - cc -
+   MTU    interface 1500 · path 1420 · router frag-needed message: no ·
+          tunnel overhead 0 B
    Route  dev eth0 (veth) via - · tunnel remote - local -
    iperf3 down1 58.2 · down4 412.6 (retr 212) · up4 377.9 (retr 88) Mbit/s
-   Host   CPU during download: all -% · busiest 63% (cpu1) · softirq -% · TCP retrans -%
+   Host   CPU during download: all -% · busiest 63% (cpu1) · softirq -% ·
+          TCP retrans -%
    Drops  NIC 0 · backlog 0 · budget squeeze 0
+   Engine realm 398 Mbit/s · direct (best run) 412.6 Mbit/s · process CPU
+          38% · busiest core 41%
    Host   load 0.4 on 2 CPU · conntrack 2210/262144 (0%) · TCP rmem max 6 MB
 ```
 
@@ -193,7 +202,7 @@ iperf3 را نصب می‌کند، فقط به همان IP اجازهٔ اتصا
 | ۱ بهینه‌سازی سریع | BBR + fq، سقف بافر TCP (۳۲ مگابایت)، محدودیت‌های conntrack / backlog / فایل (**فقط بالا می‌برد، هیچ‌وقت پایین نمی‌آورد**)، RPS و آفلودهای کارت شبکه. **هرچه اعمال می‌شود در جدول تأیید دیده می‌شود.** صف کارت شبکه فقط وقتی پیش‌فرض کرنل (pfifo_fast) باشد به fq عوض می‌شود؛ صفی که خودتان تنظیم کرده‌اید (htb، netem، cake، fq_codel …) دست نمی‌خورد. اگر سیستم (مثلاً کانتینر) اجازهٔ تغییر ندهد، پیام «چیزی تغییر نکرد» می‌دهد، نه «انجام شد» |
 | ۲ تنظیم یک تانل (Tune) | پروفایل کاربرد: **گیمینگ / تماس**، **حداکثر پهنای باند**، **متعادل**، **کاربر زیاد** (جدول زیر) |
 | ۳ MTU خودکار | MTU واقعی مسیر را اندازه می‌گیرد. روی اینترفیس تانلی (GRE، IPIP، WireGuard، VXLAN …) خود MTU را با احتساب سربار پایین می‌آورد؛ روی بقیه فقط MTU مسیر مقصد قفل می‌شود (ترافیک دیگر دست نمی‌خورد)؛ برای تانل iptables ‏MSS هم کلمپ می‌شود |
-| ۴ بنچمارک DNS | Cloudflare، Google، Quad9، OpenDNS، AdGuard، CleanBrowsing و DNSهای فعلی سرور را (سرعت کش و سرعت واقعی) می‌سنجد. DNSی که برای نام عمومی آدرس خصوصی بدهد (فیلتر/هایجک) یا NXDOMAIN را جعل کند رد می‌شود. اگر تانل‌ها نام دامنه به‌عنوان مقصد دارند، DNSی که آن نام‌ها را resolve نکند رد می‌شود. دو DNS برتر اعمال می‌شود (systemd-resolved، NetworkManager یا resolv.conf — اولین DNS قبلی به‌عنوان پشتیبان در resolv.conf می‌ماند؛ اگر NetworkManager با dnsmasq/stub محلی کار می‌کند دست زده نمی‌شود و فقط راهنمایی می‌شود)، اگر بعد از تغییر نام‌ها resolve نشد خودکار برمی‌گردد و `pfm sync` بازنویسی توسط DHCP را ترمیم می‌کند |
+| ۴ بنچمارک DNS | Cloudflare، Google، Quad9، OpenDNS، AdGuard، CleanBrowsing و DNSهای فعلی سرور را (سرعت کش و سرعت واقعی) می‌سنجد. DNSی که برای نام عمومی آدرس خصوصی بدهد (فیلتر/هایجک) یا NXDOMAIN را جعل کند رد می‌شود. اگر تانل‌ها نام دامنه به‌عنوان مقصد دارند، DNSی که آن نام‌ها را resolve نکند رد می‌شود. دو DNS برتر اعمال می‌شود (systemd-resolved، NetworkManager یا resolv.conf ساده — فقط در حالت resolv.conf ساده اولین DNS قبلی به‌عنوان پشتیبان در انتهای لیست می‌ماند؛ اگر NetworkManager با dnsmasq/stub محلی کار می‌کند دست زده نمی‌شود و فقط راهنمایی می‌شود)، اگر بعد از تغییر نام‌ها resolve نشد خودکار برمی‌گردد و `pfm sync` بازنویسی توسط DHCP را ترمیم می‌کند |
 | ۵ BBR / بافر / محدودیت‌ها | هرکدام جدا، با توضیح و تأیید |
 | ۶ کارت شبکه | RPS برای کارت تک‌صفه (VPS)، GRO/GSO/TSO روشن و LRO خاموش، در صورت دراپ: بافر حلقه |
 | ۷ Bench Test | همان تست کامل |
@@ -365,11 +374,11 @@ Find out how good a tunnel really is and where it loses. **Manage Tunnels → pi
 bash <(curl -sL https://raw.githubusercontent.com/parham381/PFM/main/pfm.sh) bench-server 5201 <IP of the PFM server>
 ```
 
-It installs iperf3, accepts only that IP and stops by itself after 15 minutes (adjustable, 1-120), removing its temporary firewall rules. **The restriction is checked in the firewall before the helper starts**; if it cannot be installed the helper does not start (open to everybody only if you run it without an IP). A port that another service uses (TCP or UDP, e.g. WireGuard) is refused, and rules left by a helper that was killed with `kill -9` are swept at the next start. Without a helper the full test only skips the speed part; this server's own internet speed (downloads up to 100 MB from Cloudflare) is measured only with `--inet` or a `y` in the menu. If users are connected through the tunnel right now, the test warns and asks before the speed test (it moves about 4 GB at 1 Gbit/s).
+It installs iperf3, accepts only that IP and stops by itself after 15 minutes (adjustable, 1-120), removing its temporary firewall rules. **The restriction is checked in the firewall before the helper starts**; if it cannot be installed the helper does not start (open to everybody only if you run it without an IP). A port that another service uses (TCP or UDP, e.g. WireGuard) is refused, and rules left by a helper that was killed with `kill -9` are swept at the next start (but kept while its orphaned iperf3 still serves the port, so the port is never opened to everybody); a timer process of its own also removes them at the deadline. Without a helper the full test only skips the speed part; this server's own internet speed (downloads up to 100 MB from Cloudflare) is measured only with `--inet` or a `y` in the menu. If users are connected through the tunnel right now, the test warns and asks before the speed test (it moves about 4 GB at 1 Gbit/s; the default answer is no). `--peer` / `--inet` mean the full test.
 
 **The report** is designed to be screenshotted (under 90 columns):
 
-- score 0-100 and grade A-F - a serious problem (packet loss, jitter, bufferbloat, MTU black hole) caps the score whatever else is fine. **How many probes were lost matters, not just the percentage**: one lost ping of 40 (2.5%) is no pattern and does not break the grade; it takes 3 lost probes or two separate loss events. If no ping gets through while the line is busy, that is "bad", not "flat latency"; if nothing answers at all (e.g. a UDP-only service) the report says "not measurable", not 0/100. A blocked or stopped tunnel is reported first
+- score 0-100 and grade A-F - a serious problem (packet loss, jitter, bufferbloat, MTU black hole) caps the score whatever else is fine. **How many probes were lost matters, not just the percentage**: one lost ping of 40 (2.5%) is no pattern and does not break the grade; it takes 3 lost probes. If no ping gets through while the line is busy (or 30% or more are lost), that is "bad", not "flat latency"; TCP connections to the service port that fail although ping works are a finding of their own and cap the grade; if nothing answers at all (e.g. a UDP-only service) the report says "not measurable", not 0/100. A blocked or stopped tunnel is reported first
 - how good the tunnel is for gaming, streaming/downloads, calls and daily use (in a quick test "streaming/downloads" is **n/a** - no speed was measured). The report states that it covers the *server → destination* leg only
 - the numbers, a stability graph and plain-language **findings**
 - **next steps** wired to the Optimization Assistant: press the number of a suggestion to apply it right there, then `r` to test again - the new report shows the difference to the previous test and what the assistant changed in between
@@ -383,9 +392,12 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
 ```
   PFM BENCH TEST  PFM v2.0 · 2026-10-18 21:40 · full · 178s
   ────────────────────────────────────────────────────────────────────────────
-  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced · owner ali
-  Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel 5.15.0-125-generic
-  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc pfifo_fast
+  Tunnel  :8443 → 203.0.113.45:443   engine realm · profile balanced ·
+          owner ali
+  Server  ir-edge1 · Ubuntu 22.04.5 LTS · 2 vCPU / 3920 MB · kvm · kernel
+          5.15.0-125-generic
+  Path    eth0 (veth, MTU 1500) · src 198.51.100.20 · cc cubic · qdisc
+          pfifo_fast
   ────────────────────────────────────────────────────────────────────────────
   OVERALL  ████████████████░░░░  83/100  Grade B
   covers the server → destination leg only
@@ -404,7 +416,7 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
    Upload       377.9 Mbit/s (4 streams)  ·  retransmits 88       
    UDP 1 Mbit/s loss 0.12%  jitter 2.1 ms (200-byte packets)       
    Under load   +61 ms (worst ping: idle 70, down 131, up 97 ms)   ● FAIR
-   Engine       realm = 96% of direct speed, engine CPU 38%, busiest core 41% 
+   Engine       realm 398.0 Mbit/s = 96% of direct 412.6 Mbit/s, its CPU 38% 
    Live now     down 3.1 / up 0.4 Mbit/s, 9 connections            
   ────────────────────────────────────────────────────────────────────────────
   FINDINGS
@@ -438,13 +450,19 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
    Loss on middle hops only (not at the last hop) is ICMP rate-limiting.
   ────────────────────────────────────────────────────────────────────────────
   RAW NUMBERS
-   ICMP   sent 300 recv 299 · min 58.9 avg 61.3 p50 - p95 69.8 max 143.2 ms · stdev - · loss events 0
-   TCP    10/10 ok · min - avg 61.9 max - ms · kernel: mss 1448 pmtu - rtt 60.5 ms cwnd - cc -
-   MTU    interface 1500 · path 1420 · router frag-needed message: no · tunnel overhead 0 B
+   ICMP   sent 300 recv 299 · min 58.9 avg 61.3 p50 - p95 69.8 max 143.2 ms
+          · stdev - · loss events 0
+   TCP    10/10 ok · min - avg 61.9 max - ms · kernel: mss 1448 pmtu - rtt
+          60.5 ms cwnd - cc -
+   MTU    interface 1500 · path 1420 · router frag-needed message: no ·
+          tunnel overhead 0 B
    Route  dev eth0 (veth) via - · tunnel remote - local -
    iperf3 down1 58.2 · down4 412.6 (retr 212) · up4 377.9 (retr 88) Mbit/s
-   Host   CPU during download: all -% · busiest 63% (cpu1) · softirq -% · TCP retrans -%
+   Host   CPU during download: all -% · busiest 63% (cpu1) · softirq -% ·
+          TCP retrans -%
    Drops  NIC 0 · backlog 0 · budget squeeze 0
+   Engine realm 398 Mbit/s · direct (best run) 412.6 Mbit/s · process CPU
+          38% · busiest core 41%
    Host   load 0.4 on 2 CPU · conntrack 2210/262144 (0%) · TCP rmem max 6 MB
 ```
 
@@ -459,7 +477,7 @@ It installs iperf3, accepts only that IP and stops by itself after 15 minutes (a
 | 1 Quick Optimize | BBR + fq, TCP buffer limit (32 MB), conntrack / backlog / file limits (**only ever raised, never lowered**), RPS and offloads of the network card. **Everything that is applied is in the table you confirm.** The card's queue becomes fq only when it is the kernel default (pfifo_fast); a queue you configured (htb, netem, cake, fq_codel ...) is never touched. If the system refuses the writes (containers) it says "nothing was changed", not "done" |
 | 2 Tune a tunnel | pick the use of a tunnel: **Gaming / calls**, **Max bandwidth**, **Balanced**, **Many users** (table below) |
 | 3 MTU auto-tune | measures the real path MTU. On tunnel interfaces (GRE, IPIP, WireGuard, VXLAN …) it lowers the interface MTU, underlay overhead included; elsewhere it pins the MTU on the route to the destination only (other traffic is untouched); kernel-NAT tunnels also get a TCP MSS clamp |
-| 4 DNS benchmark | measures Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing and the server's current resolvers (cached and uncached speed). A resolver that answers a public name with a private address (filtering / hijack) or invents answers for missing names is rejected. If your tunnels use host names as destinations, a resolver that cannot resolve them is rejected too. The best two are applied (systemd-resolved, NetworkManager or resolv.conf - your first current resolver stays behind them as a fallback; NetworkManager with a local dnsmasq / stub is left alone and only explained); if names stop resolving the change rolls back by itself, and `pfm sync` repairs a DHCP client rewriting resolv.conf |
+| 4 DNS benchmark | measures Cloudflare, Google, Quad9, OpenDNS, AdGuard, CleanBrowsing and the server's current resolvers (cached and uncached speed). A resolver that answers a public name with a private address (filtering / hijack) or invents answers for missing names is rejected. If your tunnels use host names as destinations, a resolver that cannot resolve them is rejected too. The best two are applied (systemd-resolved, NetworkManager or plain resolv.conf - only in the plain resolv.conf mode your first current resolver stays behind them as a fallback; NetworkManager with a local dnsmasq / stub is left alone and only explained); if names stop resolving the change rolls back by itself, and `pfm sync` repairs a DHCP client rewriting resolv.conf |
 | 5 BBR / buffers / limits | each one separately, with an explanation and a confirmation |
 | 6 Network card | RPS for single-queue cards (typical VPS), GRO/GSO/TSO on and LRO off, ring buffers when packets are dropped |
 | 7 Bench Test | the test above |

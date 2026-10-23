@@ -1731,7 +1731,7 @@ conn_count() {    # tracked connections whose original destination port is <port
 declare -A BN=()          # metrics of the running test
 BN_FIND=()                # findings   "sev|text"      sev: crit warn info ok
 BN_RECO=()                # actions    "id|why"        ids are handled by assist_do
-BN_ABORT=0; BN_MASK=0; BN_STEP=0; BN_TOTAL=0
+BN_ABORT=0; BN_MASK=0; BN_STEP=0; BN_TOTAL=0; BN_TMP=""
 
 bn_dur() { [[ "${PFM_BENCH_FAST:-0}" == 1 ]] && echo "$2" || echo "$1"; }     # bn_dur <seconds> <seconds when PFM_BENCH_FAST=1 (tests)>
 bset() { BN["$1"]="$2"; }
@@ -1741,6 +1741,7 @@ bn_find() { BN_FIND+=("$1|$2"); }
 bn_reco() { local r; for r in "${BN_RECO[@]}"; do [[ "${r%%|*}" == "$1" ]] && return 0; done; BN_RECO+=("$1|$2"); }
 bn_step() { BN_STEP=$((BN_STEP + 1)); printf "  ${GR}[%d/%d]${NC} %-36s" "$BN_STEP" "$BN_TOTAL" "$1"; }
 bench_kill_children() { local p; for p in $(jobs -p 2> /dev/null); do kill "$p" 2> /dev/null; done; pkill -P $$ 2> /dev/null; bench_engine_stop; return 0; }
+bench_tmp_drop() { [[ -n "$BN_TMP" ]] && rm -f "$BN_TMP"; BN_TMP=""; return 0; }       # the scratch file of the speed test: also when the process is terminated
 
 # ── collect the facts the test is about ──
 bench_prepare() {
@@ -1805,20 +1806,20 @@ bench_engine_stop() {
 # ── throughput suite: needs the helper running on the destination ──
 bench_speed() {    # bench_speed <ip> <peer port>
     local ip="$1" pp="$2" dev method tmp lp c0 c1 n0 n1 s0 s1 t0 t1 ramp pcount piv sd
-    dev=$(bget r_dev); method=$(bget method); tmp=$(mktemp)
+    dev=$(bget r_dev); method=$(bget method); tmp=$(mktemp); BN_TMP="$tmp"
     ramp=$(bn_dur 1.5 0.4); pcount=$(bn_dur 10 4); piv=$(bn_dur 0.5 0.3); sd=$(bn_dur 8 2); bset spd_secs "$sd"
     n0=$(nic_stat "$dev"); s0=$(softnet_stat); t0=$(tcp_snmp)
     bn_kv dl1 "$(iperf_tcp "$ip" "$pp" "$(bn_dur 6 2)" 1 1)"                       # one stream = what a single download feels like
-    (( BN_ABORT )) && { rm -f "$tmp"; return; }
+    (( BN_ABORT )) && { bench_tmp_drop; return; }
     c0=$(cpu_snap); ( sleep "$ramp"; probe_ping "$ip" "$pcount" "$piv" > "$tmp" ) & lp=$!       # pings while the line is full (after the ramp-up)
     bn_kv dl4 "$(iperf_tcp "$ip" "$pp" "$sd" 4 1)"                                 # four streams = the link's capacity
     c1=$(cpu_snap); wait "$lp" 2> /dev/null
-    bn_kv ldl "$(cat "$tmp")"; bn_kv cpu "$(cpu_diff "$c0" "$c1")"
-    (( BN_ABORT )) && { rm -f "$tmp"; return; }
+    bn_kv ldl "$(cat "$tmp" 2> /dev/null)"; bn_kv cpu "$(cpu_diff "$c0" "$c1")"
+    (( BN_ABORT )) && { bench_tmp_drop; return; }
     ( sleep "$ramp"; probe_ping "$ip" "$pcount" "$piv" > "$tmp" ) & lp=$!
     bn_kv ul4 "$(iperf_tcp "$ip" "$pp" "$sd" 4 0)"
-    wait "$lp" 2> /dev/null; bn_kv lul "$(cat "$tmp")"
-    (( BN_ABORT )) && { rm -f "$tmp"; return; }
+    wait "$lp" 2> /dev/null; bn_kv lul "$(cat "$tmp" 2> /dev/null)"
+    (( BN_ABORT )) && { bench_tmp_drop; return; }
     bn_kv udp "$(iperf_udp "$ip" "$pp" "$sd" 1M 200)"                              # game / voice-like stream
     case "$method" in
         realm|haproxy)
@@ -1834,7 +1835,7 @@ bench_speed() {    # bench_speed <ip> <peer port>
                 bench_engine_stop
                 # two runs over the internet differ by 20-30% on their own: when the engine looks slow, measure the direct path once more and compare with the better one
                 e=$(bget eng_mbps 0); d=$(bget dl4_mbps 0)
-                if fl "$d" '>' 0 && fl "$e" '<' "$(awk -v d="$d" 'BEGIN { print d * 0.75 }')" && (( ! BN_ABORT )); then bn_kv dl4b "$(iperf_tcp "$ip" "$pp" "$sd" 4 1)"; fi
+                if [[ -n "$(bget eng_mbps)" ]] && fl "$d" '>' 0 && fl "$e" '<' "$(awk -v d="$d" 'BEGIN { print d * 0.75 }')" && (( ! BN_ABORT )); then bn_kv dl4b "$(iperf_tcp "$ip" "$pp" "$sd" 4 1)"; fi
             fi ;;
     esac
     n1=$(nic_stat "$dev"); s1=$(softnet_stat); t1=$(tcp_snmp)
@@ -1842,12 +1843,12 @@ bench_speed() {    # bench_speed <ip> <peer port>
     bset softnet_drops "$(awk -v a="$s0" -v b="$s1" 'BEGIN { split(a, x, " "); split(b, y, " "); print y[1] - x[1] }')"
     bset softnet_squeeze "$(awk -v a="$s0" -v b="$s1" 'BEGIN { split(a, x, " "); split(b, y, " "); print y[2] - x[2] }')"
     bset tcp_retrans_pct "$(awk -v a="$t0" -v b="$t1" 'BEGIN { split(a, x, " "); split(b, y, " "); o = y[1] - x[1]; r = y[2] - x[2]; printf "%.2f", (o > 0 ? r * 100 / o : 0) }')"
-    rm -f "$tmp"
+    bench_tmp_drop
 }
 
 # ── the test ──
 bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1 = also measure this server's own internet speed]
-    local port="$1" mode="${2:-quick}" pport="${3:-0}" inet="${4:-0}" ip dport method dev t_start ser win secs imtu
+    local port="$1" mode="${2:-quick}" pport="${3:-0}" inet="${4:-0}" ip dport method dev t_start ser win secs imtu declined=0
     bench_prepare "$port" || { echo -e "  ${R}Cannot start the test: tunnel not found, destination does not resolve, or no route to it.${NC}"; return 1; }
     ip=$(bget ip); dport=$(bget dport); method=$(bget method); dev=$(bget r_dev)
     # an optional tool is asked for BEFORE the numbered steps start, where the question can be seen and answered
@@ -1855,8 +1856,8 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1
     t_start=$(date +%s); bset mode "$mode"; bset peer "$pport"
     BN_STEP=0; BN_TOTAL=5; [[ "$mode" == full ]] && BN_TOTAL=6
     trap 'BN_ABORT=1; bench_kill_children' INT
-    trap 'bench_kill_children; trap - INT TERM HUP; exit 143' TERM
-    trap 'bench_kill_children; trap - INT TERM HUP; exit 129' HUP
+    trap 'bench_kill_children; bench_tmp_drop; trap - INT TERM HUP; exit 143' TERM
+    trap 'bench_kill_children; bench_tmp_drop; trap - INT TERM HUP; exit 129' HUP
     echo -e "\n  ${B}${W}Bench Test${NC}  ${GR}:${port} -> $(bget dest):${dport}  [${method}]  mode: ${mode}${NC}\n" | bn_out
 
     # 1) latency, jitter, loss, stability (one run feeds numbers and sparkline)
@@ -1887,7 +1888,8 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1
     if [[ "$(bget icmp_ok 0)" == 1 ]]; then
         imtu=$(bget r_effmtu 0); [[ "$imtu" =~ ^[0-9]+$ ]] && (( imtu >= 576 )) || imtu=1500
         bn_kv m "$(probe_mtu "$ip" "$imtu")"
-        echo -e "path $(bget m_pmtu "?") / interface $(bget m_iface "?")   black-hole: $([[ "$(bget m_blackhole 0)" == 1 ]] && echo YES || echo no)"
+        if [[ "$(bget m_unreliable 0)" == 1 ]]; then echo -e "${Y}not reliable (replies lost / rate-limited) - ignored${NC}"
+        else echo -e "path $(bget m_pmtu "?") / interface $(bget m_iface "?")   black-hole: $([[ "$(bget m_blackhole 0)" == 1 ]] && echo YES || echo no)"; fi
     else bset m_icmp blocked; echo -e "${GR}skipped (ICMP filtered)${NC}"; fi
     (( BN_ABORT )) && { bench_aborted; return 130; }
 
@@ -1913,7 +1915,9 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1
         if (( pport > 0 )) && { [[ "$(bget conns 0)" -gt 0 ]] || fl "$(bget lv_down 0)" '>' 1 || fl "$(bget lv_up 0)" '>' 1; }; then
             echo -e "\n  ${Y}$(bget conns 0) connection(s) use this tunnel right now ($(bget lv_down 0) down / $(bget lv_up 0) up Mbit/s).${NC}"
             echo -e "  ${GR}The speed test fills the line for about 40 seconds (up to ~4 GB of traffic at 1 Gbit/s) and slows them down.${NC}"
-            confirm "Run the speed test now?" y || { pport=0; bset peer 0; }
+            trap - INT                                   # a question: Ctrl+C answers it like at every other prompt (a trapped INT leaves the prompt waiting)
+            confirm "Run the speed test now?" n || { pport=0; bset peer 0; declined=1; }
+            trap 'BN_ABORT=1; bench_kill_children' INT
             echo ""
         fi
         if (( pport > 0 )); then
@@ -1928,7 +1932,9 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1
             if [[ -n "$(bget inet_down)" ]]; then echo -e "down $(bget inet_down) Mbit/s   up $(bget inet_up) Mbit/s"
             else echo -e "${GR}unreachable${NC}"; fi
         else
-            bn_step "Speed test"; echo -e "${GR}skipped (needs the helper on the destination)${NC}"
+            bn_step "Speed test"
+            if (( declined )); then echo -e "${GR}skipped (not run while the tunnel is in use)${NC}"
+            else echo -e "${GR}skipped (needs the helper on the destination)${NC}"; fi
         fi
     fi
     trap - INT TERM HUP
@@ -1937,7 +1943,7 @@ bench_run() {    # bench_run <port> <quick|full> [peer iperf3 port, 0 = none] [1
     bench_analyze
     return 0
 }
-bench_aborted() { trap - INT TERM HUP; bench_engine_stop; echo -e "\n  ${Y}Test cancelled.${NC}"; }
+bench_aborted() { trap - INT TERM HUP; bench_engine_stop; bench_tmp_drop; echo -e "\n  ${Y}Test cancelled.${NC}"; }
 
 # ── scoring ──
 sc_latency() { awk -v v="$1" 'BEGIN { print (v <= 40 ? 100 : v <= 80 ? 90 : v <= 150 ? 75 : v <= 250 ? 55 : 35) }'; }
@@ -1965,7 +1971,7 @@ bench_analyze() {
     # loss: HOW MANY probes were lost decides how serious it is (one lost ping of 40 is 2.5% and still means nothing)
     if [[ "$icmp" == 1 ]]; then
         rtt=$(bget p_avg); jit=$(bget p_jitter); loss=$(bget p_loss); sent=$(bget p_sent 0); lost=$(( sent - $(bget p_recv 0) ))
-        if (( lost >= 3 )) || (( $(bget p_lossev 0) >= 2 )); then lsig=1; fi
+        (( lost >= 3 )) && lsig=1
     else
         rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter); loss=""; lsrc=tcp
         if (( tcp_ok > 0 && tcp_n > 0 )); then               # no ICMP: failed handshakes are the only loss signal
@@ -1992,6 +1998,9 @@ bench_analyze() {
         bn_find warn "TCP port $(bget dport) does not accept connections. Normal for UDP-only services (WireGuard, QUIC, games); otherwise the service is down or filtered."
     elif [[ "$icmp" != 1 ]]; then
         bn_find info "ICMP is filtered on the way, so loss / MTU numbers rely on TCP only and are less precise."
+    elif (( tcp_n - tcp_ok >= 3 )); then            # ping is fine, the service itself drops connection attempts
+        bset t_fails "$(( tcp_n - tcp_ok ))"
+        bn_find warn "$(( tcp_n - tcp_ok )) of $tcp_n TCP connections to port $(bget dport) failed although ping works: the service is overloaded or rate-limits new connections, or a firewall drops some of the SYN packets."
     fi
 
     # loss
@@ -2051,26 +2060,37 @@ bench_analyze() {
 
     # speed suite
     dl1=$(bget dl1_mbps); dl4=$(bget dl4_mbps)
-    if (( $(bget peer 0) > 0 )) && [[ -z "$dl4" ]]; then
+    if [[ "$(bget mode)" == full ]] && (( $(bget peer 0) > 0 )) && [[ -z "$dl4" ]]; then
         bn_find warn "The speed test could not run ($(bget dl4_err "no result from iperf3")). Check that the helper still runs on the destination and that TCP and UDP port $(bget peer) are open to this server."
     fi
     if [[ -n "$dl4" ]]; then
         # latency under load: only pings that really came back count; the tail is compared with the idle tail (jitter cancels out)
-        local bl_dl="" bl_ul="" ld lu
-        ld=$(bget ldl_recv 0); lu=$(bget lul_recv 0)
+        local bl_dl="" bl_ul="" ld lu lds lus ldn lun lpd=0 lpu=0 dl_dead=0 ul_dead=0
+        ld=$(bget ldl_recv 0); lu=$(bget lul_recv 0); lds=$(bget ldl_sent 0); lus=$(bget lul_sent 0)
         (( ld > 0 )) && bl_dl=$(awk -v l="$(bget ldl_p95 0)" -v i="$(bget p_p95 "${rtt:-0}")" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
         (( lu > 0 )) && bl_ul=$(awk -v l="$(bget lul_p95 0)" -v i="$(bget p_p95 "${rtt:-0}")" 'BEGIN { d = l - i; print d < 0 ? 0 : d }')
         bset bl_dl "$bl_dl"; bset bl_ul "$bl_ul"
-        if [[ "$icmp" == 1 ]] && { (( ld == 0 )) || (( lu == 0 )); } && (( $(bget ldl_sent 0) + $(bget lul_sent 0) > 0 )); then
+        (( lds > 0 && ld == 0 )) && dl_dead=1
+        (( lus > 0 && lu == 0 )) && ul_dead=1
+        if [[ "$icmp" == 1 ]] && (( dl_dead || ul_dead )); then
             bset load_lost 1
-            bn_find crit "No ping got through while the line was busy ($( (( ld == 0 )) && echo download )$( (( ld == 0 && lu == 0 )) && echo " and ")$( (( lu == 0 )) && echo upload )): the connection is saturated so badly that everything else stops - or the destination rate-limits ping under load."
+            bn_find crit "No ping got through while the line was busy ($( ((dl_dead)) && echo download )$( ((dl_dead && ul_dead)) && echo " and ")$( ((ul_dead)) && echo upload )): the connection is saturated so badly that everything else stops - or the destination rate-limits ping under load."
             [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR + fq keep queues short while the line is busy"
+        elif [[ "$icmp" == 1 ]]; then               # some pings did come back; how many did not is part of the picture (the latency figure only knows the ones that came)
+            ldn=$(( lds - ld )); lun=$(( lus - lu ))
+            (( lds > 0 )) && lpd=$(( ldn * 100 / lds )); (( lus > 0 )) && lpu=$(( lun * 100 / lus ))
+            if (( ldn >= 3 && lpd >= 30 )) || (( lun >= 3 && lpu >= 30 )); then
+                bset load_loss 1; bset ll_dl "$lpd"; bset ll_ul "$lpu"
+                bn_find warn "While the line was busy ${lpd}% of the pings in the download phase and ${lpu}% in the upload phase got no answer: queues overflow (or the destination rate-limits ping under load). The 'Under load' latency covers only the pings that came back."
+                [[ "$cc" != bbr && "$method" != iptables ]] && bn_reco bbr "BBR + fq keep queues short while the line is busy"
+            fi
         fi
         if [[ -n "$bl_dl$bl_ul" ]]; then
             bloat=$(awk -v a="${bl_dl:-0}" -v b="${bl_ul:-0}" 'BEGIN { print (a > b ? a : b) }'); bset bloat "$bloat"
             if fl "$bloat" '>=' 300; then
                 bn_find crit "Bufferbloat: latency jumps by +$(fmt0 "$bloat") ms while the line is busy. During any big download everything else lags."
             elif fl "$bloat" '>=' 100; then bn_find warn "Latency rises by +$(fmt0 "$bloat") ms under load (bufferbloat)."
+            elif [[ "$(bget load_loss 0)" == 1 ]]; then :        # the pings that came back are not the whole story: the finding about the lost ones says it
             elif fl "$bloat" '>=' 30; then bn_find info "Latency rises by +$(fmt0 "$bloat") ms under load - acceptable."
             else bn_find ok "Latency stays flat under load (+$(bn_ms "$bloat") ms)."; fi
             if fl "$bloat" '>=' 100; then
@@ -2089,10 +2109,10 @@ bench_analyze() {
         fi
         local ratio dbest ecpu engflag=0; dbest=$(awk -v a="$dl4" -v b="$(bget dl4b_mbps 0)" 'BEGIN { print (b + 0 > a + 0 ? b : a) }')
         ratio=$(awk -v e="$(bget eng_mbps 0)" -v d="$dbest" 'BEGIN { print (d > 0 ? e * 100 / d : 0) }')
-        bset eng_ratio "$ratio"; ecpu=$(bget eng_cpu 0)
+        bset eng_ratio "$ratio"; bset eng_direct "$dbest"; ecpu=$(bget eng_cpu 0)
         if [[ -n "$(bget eng_mbps)" ]]; then
             if fl "$ratio" '<' 75; then
-                if fl "$ecpu" '>=' 80 || fl "$(bget engc_max 0)" '>=' 90; then
+                if fl "$ecpu" '>=' 80; then
                     engflag=1
                     bn_find warn "The $method engine delivers only $(fmt0 "$ratio")% of the direct speed and its CPU is saturated (${ecpu}% of a core): the forwarder itself is the bottleneck."
                     bn_reco engine "try the other engine (iptables: no userspace copy)"
@@ -2155,8 +2175,9 @@ bench_score() {
     if [[ "$(bget icmp_ok 0)" == 1 ]]; then rtt=$(bget p_avg); jit=$(bget p_jitter)
     else rtt=$(bget ci_krtt "$(bget t_avg)"); jit=$(bget t_jitter); fi
     loss=$(bget l_eff)                     # the loss figure the findings use: ONE lost probe is damped to 0.5%, three or more count in full
+    local dead=0 nv=-1; [[ "$(bget blocked 0)" == 1 || "$(bget up 1)" == 0 ]] && { dead=1; nv=0; }       # a blocked / stopped tunnel is no good for anything, whatever the destination does
     if [[ "$(bget nomeasure 0)" == 1 ]]; then      # nothing answers: there is nothing to grade (not "0 out of 100": it may simply be a UDP-only service)
-        bset score ""; bset grade "-"; bset v_game -1; bset v_stream -1; bset v_daily -1; bset v_calls -1; return
+        bset score ""; bset grade "-"; bset v_game "$nv"; bset v_stream "$nv"; bset v_daily "$nv"; bset v_calls "$nv"; return
     fi
     add() { t=$(awk -v t="$t" -v s="$1" -v w="$2" 'BEGIN { print t + s * w }'); w=$((w + $2)); }
     [[ -n "$rtt" ]] && { s=$(sc_latency "$rtt"); bset sc_lat "$s"; add "$s" 20; }
@@ -2179,6 +2200,8 @@ bench_score() {
     [[ -n "$jit" ]] && { fl "$jit" '>=' 20 && capf 75 jitter; fl "$jit" '>=' 30 && capf 65 jitter; fl "$jit" '>=' 40 && capf 55 jitter; }
     [[ -n "$bl" ]] && { fl "$bl" '>=' 100 && capf 80 bufferbloat; fl "$bl" '>=' 300 && capf 65 bufferbloat; }
     [[ "$(bget load_lost 0)" == 1 ]] && capf 65 "no reply under load"
+    [[ "$(bget load_loss 0)" == 1 ]] && capf 75 "pings lost under load"
+    local tf; tf=$(bget t_fails 0); (( tf >= 3 )) && capf 78 "failed TCP connections"; (( tf >= 5 )) && capf 60 "failed TCP connections"
     [[ "$(bget m_blackhole 0)" == 1 ]] && capf 50 "MTU black hole"
     [[ "$(bget blocked 0)" == 1 || "$(bget up 1)" == 0 ]] && capf 40 "tunnel not running"
     unset -f capf
@@ -2195,6 +2218,7 @@ bench_score() {
     elif fl "$ls" '<=' 2 && fl "$d4" '>=' 15; then st=1; fi
     if   fl "$ls" '<=' 2 && fl "$l" '<=' 250; then dy=2; elif fl "$ls" '<=' 5; then dy=1; fi
     if   fl "$j" '<=' 15 && fl "$ls" '<=' 1; then ca=2; elif fl "$j" '<=' 30 && fl "$ls" '<=' 3; then ca=1; fi
+    if (( dead )); then g=0; st=0; dy=0; ca=0; fi
     bset v_game "$g"; bset v_stream "$st"; bset v_daily "$dy"; bset v_calls "$ca"
 }
 
@@ -2205,6 +2229,14 @@ bn_wrap() {    # bn_wrap <coloured marker> <text>: text folded to the report wid
         if (( first )); then printf "   %b %s\n" "$mark" "$line"; first=0; else printf "     %s\n" "$line"; fi
     done < <(fold -s -w 70 <<< "$2" | sed 's/ *$//')
 }
+bn_fold() {    # bn_fold <first-line prefix (colours allowed)> <prefix of the following lines> <text>: the text folded to the report width
+    local first=1 line
+    while IFS= read -r line; do
+        if (( first )); then printf '%b%s\n' "$1" "$line"; first=0; else printf '%s%s\n' "$2" "$line"; fi
+    done < <(fold -s -w 68 <<< "$3" | sed 's/ *$//')
+}
+bn_head() { bn_fold "  ${W}$(printf '%-6s' "$1")${NC}  " "          " "$2"; }       # Tunnel / Server / Path
+bn_raw()  { bn_fold "   $(printf '%-6s' "$1") " "          " "$2"; }                  # the numbers of the details page
 bn_mbps() {
     if [[ -z "$1" ]]; then printf '%s' '-'
     elif fl "$1" '>=' 1000; then printf '%s Gbit/s' "$(awk -v v="$1" 'BEGIN { printf "%.2f", v / 1000 }')"
@@ -2219,9 +2251,9 @@ bench_report_summary() {
     local gc="$G"; fl "$sc" '<' 80 && gc="$Y"; fl "$sc" '<' 55 && gc="$R"
     echo -e "  ${B}${C}PFM BENCH TEST${NC}  ${GR}PFM v$(bget ver) · $(date -d "@$(bget ts)" '+%Y-%m-%d %H:%M' 2> /dev/null) · $(bget mode) · $(bget secs)s${NC}"
     echo -e "  ${GR}$(hr 76)${NC}"
-    echo -e "  ${W}Tunnel${NC}  :$(bget port) → ${ip}:${dport}   engine ${method} · profile $(bget profile) · owner $(bget owner)"
-    echo -e "  ${W}Server${NC}  $(bget host) · $(bget os) · $(bget cpus) vCPU / $(bget ram) MB · $(bget virt) · kernel $(bget kernel)"
-    echo -e "  ${W}Path${NC}    $(bget r_dev) ($(bget r_kind), MTU $(bget r_devmtu)) · src $(bget r_src) · cc $(bget cc) · qdisc $(bget qdisc)"
+    bn_head Tunnel ":$(bget port) → ${ip}:${dport}   engine ${method} · profile $(bget profile) · owner $(bget owner)"
+    bn_head Server "$(bget host) · $(bget os) · $(bget cpus) vCPU / $(bget ram) MB · $(bget virt) · kernel $(bget kernel)"
+    bn_head Path "$(bget r_dev) ($(bget r_kind), MTU $(bget r_devmtu)) · src $(bget r_src) · cc $(bget cc) · qdisc $(bget qdisc)"
     echo -e "  ${GR}$(hr 76)${NC}"
     if [[ "$(bget nomeasure 0)" == 1 ]]; then
         echo -e "  ${W}OVERALL${NC}  ${Y}NOT MEASURABLE${NC}  ${GR}nothing answered from this server (see findings)${NC}"
@@ -2229,7 +2261,8 @@ bench_report_summary() {
         echo -e "  ${W}OVERALL${NC}  ${gc}${bar}${NC}  ${B}${sc}/100${NC}  Grade ${B}${gc}${grade}${NC}$([[ -n "$(bget score_cap)" ]] && echo "  ${GR}limited by $(bget score_cap)${NC}")"
         echo -e "  ${GR}covers the server → destination leg only$([[ -z "$(bget dl4_mbps)" ]] && echo " · quality only, no speed / load data")${NC}"
     fi
-    echo -e "  ${GR}Use:${NC} Gaming $(verdict_word "$(bget v_game 0)") · Streaming/Download $(verdict_word "$(bget v_stream 0)") · Calls $(verdict_word "$(bget v_calls 0)") · Daily $(verdict_word "$(bget v_daily 0)")"
+    local gnote=""; [[ -z "$(bget bloat)" && "$(bget load_lost 0)" != 1 && "$(bget v_game 0)" -ge 1 ]] && gnote=" ${GR}(idle line)${NC}"
+    echo -e "  ${GR}Use:${NC} Gaming $(verdict_word "$(bget v_game 0)")${gnote} · Streaming/Download $(verdict_word "$(bget v_stream 0)") · Calls $(verdict_word "$(bget v_calls 0)") · Daily $(verdict_word "$(bget v_daily 0)")"
     echo -e "  ${GR}$(hr 76)${NC}"
     echo -e "  ${C}QUALITY${NC} ${GR}(this server → destination)${NC}"
     if [[ "$(bget icmp_ok 0)" == 1 ]]; then
@@ -2265,7 +2298,8 @@ bench_report_summary() {
             if [[ "$(bget load_lost 0)" == 1 ]]; then bn_row "Under load" "no ping got through while the line was busy" "$(rate_dot "$(bget sc_bloat 0)")"
             elif [[ -n "$(bget bloat)" ]]; then bn_row "Under load" "+$(bn_ms "$(bget bloat 0)") ms (worst ping: idle $(bn_ms "$(bget p_p95 0)"), down $([[ -n "$(bget bl_dl)" ]] && bn_ms "$(bget ldl_p95 0)" || echo -), up $([[ -n "$(bget bl_ul)" ]] && bn_ms "$(bget lul_p95 0)" || echo -) ms)" "$(rate_dot "$(bget sc_bloat 0)")"
             else bn_row "Under load" "not measured (no ICMP answers)" "${Y}● n/a${NC}"; fi
-            [[ -n "$(bget eng_mbps)" ]] && bn_row "Engine" "$(bget method) = $(fmt0 "$(bget eng_ratio 0)")% of direct speed, engine CPU $(bget eng_cpu 0)%, busiest core $(bget engc_max "-")%" ""
+            [[ "$(bget load_loss 0)" == 1 ]] && bn_row "" "pings lost while busy: download $(bget ll_dl)%, upload $(bget ll_ul)%" ""
+            [[ -n "$(bget eng_mbps)" ]] && bn_row "Engine" "$(bget method) $(bn_mbps "$(bget eng_mbps)") = $(fmt0 "$(bget eng_ratio 0)")% of direct $(bn_mbps "$(bget eng_direct)"), its CPU $(bget eng_cpu 0)%" ""
         elif [[ -n "$(bget inet_down)" ]]; then
             bn_row "Server→Net" "down $(bget inet_down) / up $(bget inet_up) Mbit/s (Cloudflare, not via tunnel)" ""
         fi
@@ -2285,7 +2319,7 @@ bench_report_summary() {
             shown=$((shown + 1))
         done
     done
-    (( ${#BN_FIND[@]} > 7 )) && echo -e "   ${GR}... and $(( ${#BN_FIND[@]} - 7 )) more finding(s) of lower importance on the details page (d)${NC}"
+    (( ${#BN_FIND[@]} > 7 )) && echo -e "   ${GR}... and $(( ${#BN_FIND[@]} - 7 )) more finding(s) on the details page (d)${NC}"
     [[ ${#BN_FIND[@]} -eq 0 ]] && echo -e "   ${G}✓${NC} Nothing to worry about."
     if [[ ${#BN_RECO[@]} -gt 0 ]]; then
         echo -e "  ${GR}$(hr 76)${NC}"
@@ -2318,16 +2352,17 @@ bench_report_details() {
     else echo -e "   ${GR}no route data${NC}"; fi
     echo -e "  ${GR}$(hr 76)${NC}"
     echo -e "  ${C}RAW NUMBERS${NC}"
-    echo -e "   ICMP   sent $(bget p_sent 0) recv $(bget p_recv 0) · min $(bget p_min -) avg $(bget p_avg -) p50 $(bget p_p50 -) p95 $(bget p_p95 -) max $(bget p_max -) ms · stdev $(bget p_stdev -) · loss events $(bget p_lossev 0)"
-    echo -e "   TCP    $(bget t_ok 0)/$(bget t_n 0) ok · min $(bget t_min -) avg $(bget t_avg -) max $(bget t_max -) ms · kernel: mss $(bget ci_mss -) pmtu $(bget ci_pmtu -) rtt $(bget ci_krtt -) ms cwnd $(bget ci_cwnd -) cc $(bget ci_cc -)"
-    echo -e "   MTU    interface $(bget m_iface -) · path $(bget m_pmtu -) · router frag-needed message: $([[ "$(bget m_fragmsg 0)" == 1 ]] && echo yes || echo no) · tunnel overhead $(bget r_overhead 0) B"
-    echo -e "   Route  dev $(bget r_dev) ($(bget r_kind)) via $(bget r_via -) · tunnel remote $(bget r_remote -) local $(bget r_local -)"
+    bn_raw ICMP "sent $(bget p_sent 0) recv $(bget p_recv 0) · min $(bget p_min -) avg $(bget p_avg -) p50 $(bget p_p50 -) p95 $(bget p_p95 -) max $(bget p_max -) ms · stdev $(bget p_stdev -) · loss events $(bget p_lossev 0)"
+    bn_raw TCP "$(bget t_ok 0)/$(bget t_n 0) ok · min $(bget t_min -) avg $(bget t_avg -) max $(bget t_max -) ms · kernel: mss $(bget ci_mss -) pmtu $(bget ci_pmtu -) rtt $(bget ci_krtt -) ms cwnd $(bget ci_cwnd -) cc $(bget ci_cc -)"
+    bn_raw MTU "interface $(bget m_iface -) · path $(bget m_pmtu -) · router frag-needed message: $([[ "$(bget m_fragmsg 0)" == 1 ]] && echo yes || echo no) · tunnel overhead $(bget r_overhead 0) B"
+    bn_raw Route "dev $(bget r_dev) ($(bget r_kind)) via $(bget r_via -) · tunnel remote $(bget r_remote -) local $(bget r_local -)"
     if [[ -n "$(bget dl4_mbps)" ]]; then
-        echo -e "   iperf3 down1 $(bget dl1_mbps -) · down4 $(bget dl4_mbps -) (retr $(bget dl4_retr 0)) · up4 $(bget ul4_mbps -) (retr $(bget ul4_retr 0)) Mbit/s"
-        echo -e "   Host   CPU during download: all $(bget cpu_all -)% · busiest $(bget cpu_max -)% ($(bget cpu_maxcpu -)) · softirq $(bget cpu_softirq -)% · TCP retrans $(bget tcp_retrans_pct -)%"
-        echo -e "   Drops  NIC $(bget nic_drops 0) · backlog $(bget softnet_drops 0) · budget squeeze $(bget softnet_squeeze 0)"
+        bn_raw iperf3 "down1 $(bget dl1_mbps -) · down4 $(bget dl4_mbps -) (retr $(bget dl4_retr 0)) · up4 $(bget ul4_mbps -) (retr $(bget ul4_retr 0)) Mbit/s"
+        bn_raw Host "CPU during download: all $(bget cpu_all -)% · busiest $(bget cpu_max -)% ($(bget cpu_maxcpu -)) · softirq $(bget cpu_softirq -)% · TCP retrans $(bget tcp_retrans_pct -)%"
+        bn_raw Drops "NIC $(bget nic_drops 0) · backlog $(bget softnet_drops 0) · budget squeeze $(bget softnet_squeeze 0)"
+        [[ -n "$(bget eng_mbps)" ]] && bn_raw Engine "$(bget method) $(bget eng_mbps) Mbit/s · direct (best run) $(bget eng_direct -) Mbit/s · process CPU $(bget eng_cpu -)% · busiest core $(bget engc_max -)%"
     fi
-    echo -e "   Host   load $(bget load) on $(bget cpus) CPU · conntrack $(bget ct_count -)/$(bget ct_max -) (${BN[ct_pct]:-0}%) · TCP rmem max $(( ${BN[rmem_max]:-0} / 1048576 )) MB"
+    bn_raw Host "load $(bget load) on $(bget cpus) CPU · conntrack $(bget ct_count -)/$(bget ct_max -) (${BN[ct_pct]:-0}%) · TCP rmem max $(( ${BN[rmem_max]:-0} / 1048576 )) MB"
     if (( ${#BN_FIND[@]} > 7 )); then
         echo -e "  ${GR}$(hr 76)${NC}"; echo -e "  ${C}ALL FINDINGS${NC}"
         local f sev txt mk want
@@ -2401,7 +2436,9 @@ bench_compare_line() {
     local ps pt ago
     ps=$(envget "$prev" score); pt=$(envget "$prev" ts); [[ "$ps" =~ ^[0-9]+$ && "$pt" =~ ^[0-9]+$ ]] || return 0
     ago=$(( ($(bget ts) - pt) / 60 ))
-    local out="   Previous test: $(date -d "@$pt" '+%Y-%m-%d %H:%M' 2> /dev/null) (${ago} min earlier), score ${ps} → $(bget score) ($(awk -v a="$ps" -v b="$(bget score)" 'BEGIN { printf "%+d", b - a }'))"
+    local cs sctxt; cs=$(bget score)
+    if [[ "$cs" =~ ^[0-9]+$ ]]; then sctxt="${ps} → ${cs} ($(awk -v a="$ps" -v b="$cs" 'BEGIN { printf "%+d", b - a }'))"; else sctxt="${ps} → not measurable this time"; fi
+    local out="   Previous test: $(date -d "@$pt" '+%Y-%m-%d %H:%M' 2> /dev/null) (${ago} min earlier), score ${sctxt}"
     local k key lbl unit pv cv
     for k in "p_avg:latency:ms" "p_jitter:jitter:ms" "p_loss:loss:%" "dl4_mbps:download:Mbit/s" "ul4_mbps:upload:Mbit/s" "bloat:load latency:ms"; do
         IFS=: read -r key lbl unit <<< "$k"
@@ -2410,7 +2447,7 @@ bench_compare_line() {
     done
     if [[ -f "$TUNE_DIR/history.log" ]]; then
         local ch; ch=$(awk -F'|' -v t="$pt" '$1 > t { printf "%s%s", (n++ ? ", " : ""), $3 }' "$TUNE_DIR/history.log")
-        [[ -n "$ch" ]] && out+=$'\n'"   Changed in between by the assistant: $ch"
+        [[ -n "$ch" ]] && out+=$'\n'"$(bn_fold "   " "     " "Changed in between by the assistant: $ch")"
     fi
     printf '%s' "$out"
 }
@@ -2422,16 +2459,20 @@ bench_fw_remove() {    # bench_fw_remove <tag>: every rule of this helper, in ev
     command -v nft > /dev/null 2>&1 && nft delete table inet "$1" 2> /dev/null
     return 0
 }
-bench_fw_sweep() {    # rules of a helper that was killed before it could clean up (SIGKILL, power loss); helpers that are still running are left alone
-    local c t
+bench_fw_sweep() {    # rules of a helper that was killed before it could clean up (SIGKILL, power loss); helpers that are still running are left alone,
+    local c t p       # and so are rules whose port is still being served: the orphaned iperf3 would be open to everybody without them
     for c in iptables ip6tables; do command -v "$c" > /dev/null 2>&1 || continue
         for t in $($c -S INPUT 2> /dev/null | sed -n 's/.*--comment \(pfm_bench_[0-9]*\).*/\1/p' | sort -u); do
             kill -0 "${t#pfm_bench_}" 2> /dev/null && continue
+            p=$($c -S INPUT 2> /dev/null | awk -v t="$t" 'index($0, "--comment " t " ") { for (i = 1; i < NF; i++) if ($i == "--dport") { print $(i + 1); exit } }')
+            [[ -n "$p" ]] && bench_port_busy "$p" && continue
             ipt_del_tag "$c" filter INPUT "$t"
         done
     done
     command -v nft > /dev/null 2>&1 && for t in $(nft list tables 2> /dev/null | awk '$3 ~ /^pfm_bench_[0-9]+$/ { print $3 }'); do
         kill -0 "${t#pfm_bench_}" 2> /dev/null && continue
+        p=$(nft list table inet "$t" 2> /dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dport") { print $(i + 1); exit } }')
+        [[ -n "$p" ]] && bench_port_busy "$p" && continue
         nft delete table inet "$t" 2> /dev/null
     done
     return 0
@@ -2463,11 +2504,35 @@ bench_fw_restrict() {    # bench_fw_restrict <port> <allowed ip> <tag> -> 0 only
         && nft list table inet "$tag" 2> /dev/null | grep -q drop && return 0
     nft delete table inet "$tag" 2> /dev/null; return 1
 }
-bench_port_busy() { ss -ltun "( sport = :$1 )" 2> /dev/null | tail -n +2 | grep -q .; }       # a TCP or UDP service already listens there
+bench_port_busy() {    # a TCP or UDP service already listens on port $1
+    local hex f files=()
+    if command -v ss > /dev/null 2>&1; then ss -ltun "( sport = :$1 )" 2> /dev/null | tail -n +2 | grep -q .; return; fi
+    printf -v hex '%04X' "$1"                       # no ss: /proc/net lists the listening TCP (state 0A) and the bound UDP (07) sockets
+    for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do [[ -r "$f" ]] && files+=("$f"); done
+    (( ${#files[@]} )) || return 1
+    awk -v h="$hex" 'FNR > 1 { n = split($2, a, ":"); if (a[n] == h && ($4 == "0A" || $4 == "07")) f = 1 } END { exit (f ? 0 : 1) }' "${files[@]}" 2> /dev/null
+}
+bench_fw_timer() {    # runs detached (see bench_watchdog_start): after <seconds> the rules of helper <tag> go, whatever became of the helper
+    local s
+    trap 'kill "$s" 2> /dev/null; exit 0' TERM
+    sleep "$1" & s=$!
+    wait "$s"
+    bench_fw_remove "$2"
+}
+bench_watchdog_start() {    # bench_watchdog_start <seconds> <tag>: a process of its own (own session), so a kill -9 of the helper or a closing terminal cannot take it along
+    local code
+    code="$(declare -f ipt_del_tag bench_fw_remove bench_fw_timer); bench_fw_timer \"\$1\" \"\$2\""
+    if command -v setsid > /dev/null 2>&1; then setsid bash -c "$code" pfm-fw-timer "$1" "$2" > /dev/null 2>&1 < /dev/null &
+    else nohup bash -c "$code" pfm-fw-timer "$1" "$2" > /dev/null 2>&1 < /dev/null &
+    fi
+    return 0
+}
+bench_watchdog_stop() { pkill -f "pfm-fw-timer [0-9]+ $1\$" 2> /dev/null; return 0; }
 cmd_bench_server() {
-    local port="${1:-5201}" allow="${2:-}" mins="${3:-15}" tag="pfm_bench_$$" ipf="" srv="" wd="" use="usage: pfm bench-server [port] [allowed client IP] [minutes 1-120]"
+    local port="${1:-5201}" allow="${2:-}" mins="${3:-15}" tag="pfm_bench_$$" ipf="" srv="" use="usage: pfm bench-server [port] [allowed client IP] [minutes 1-120]"
     valid_port "$port" || { echo -e "${R}'$port' is not a valid port.${NC}  $use"; return 1; }
-    [[ "$mins" =~ ^[0-9]+$ ]] && (( mins >= 1 && mins <= 120 )) || { echo -e "${R}'$mins' minutes is not between 1 and 120.${NC}  $use"; return 1; }
+    [[ "$mins" =~ ^[0-9]{1,4}$ ]] && (( 10#$mins >= 1 && 10#$mins <= 120 )) || { echo -e "${R}'$mins' minutes is not between 1 and 120.${NC}  $use"; return 1; }
+    mins=$((10#$mins))
     [[ -z "$allow" ]] || valid_ip "$allow" || { echo -e "${R}'$allow' is not an IP address.${NC}  $use"; return 1; }
     [[ $EUID -eq 0 ]] || { echo -e "${R}Run as root (it installs iperf3 and opens the port for ${allow:-anyone}).${NC}"; return 1; }
     ensure_tool iperf3 "speed-test helper" || return 1
@@ -2477,9 +2542,10 @@ cmd_bench_server() {
     [[ -n "$allow" ]] && { ipf="-4"; [[ "$allow" == *:* ]] && ipf="-6"; }
     echo -e "\n  ${B}${C}PFM bench helper${NC}  iperf3 on port ${port} for ${mins} min"
     # the clean-up exists BEFORE the first firewall rule does
-    bench_server_cleanup() { [[ -n "$wd" ]] && { pkill -P "$wd" 2> /dev/null; kill "$wd" 2> /dev/null; }; bench_fw_remove "$tag"; }
+    bench_server_cleanup() { bench_watchdog_stop "$tag"; bench_fw_remove "$tag"; }
     trap 'kill "$srv" 2> /dev/null; bench_server_cleanup; echo -e "\n  ${GR}Helper stopped.${NC}"; exit 0' INT TERM HUP
     if [[ -n "$allow" ]]; then
+        bench_watchdog_start $(( mins * 60 + 30 )) "$tag"       # takes the rules out even when this process is killed with -9 (it exists before the first rule does)
         if ! bench_fw_restrict "$port" "$allow" "$tag"; then
             bench_server_cleanup; trap - INT TERM HUP
             echo -e "  ${R}Could not restrict port ${port} to ${allow} (no usable iptables / nftables rule), so the helper is NOT started - it would be open to everybody.${NC}"
@@ -2487,7 +2553,6 @@ cmd_bench_server() {
             return 1
         fi
         echo -e "  ${G}Only ${allow} may connect${NC} ${GR}(verified in the firewall; the rules are removed when this stops)${NC}"
-        ( trap '' HUP INT; sleep $(( mins * 60 + 30 )); bench_fw_remove "$tag" ) > /dev/null 2>&1 & wd=$!       # outlives a kill -9 of this process
     else echo -e "  ${Y}No client IP given: anyone who can reach port ${port} can use your bandwidth until this stops.${NC}"; fi
     echo -e "  ${G}Ready.${NC} On the PFM server choose the full test and enter port ${port}. Ctrl+C stops it.\n"
     timeout "${mins}m" iperf3 -s $ipf -p "$port" & srv=$!       # in the background + wait: a signal must run the cleanup at once
@@ -2521,7 +2586,8 @@ bench_show() {    # interactive viewer for the report of the test that just ran
             r) return 2 ;;
             ""|0|q) return 0 ;;
             *) if [[ "$act" =~ ^[0-9]+$ ]] && (( act >= 1 && act <= ${#BN_RECO[@]} )); then
-                   if assist_do "${BN_RECO[act-1]%%|*}" "$(bget port)"; then echo -e "\n  ${G}Done.${NC} Press ${W}r${NC} to run the test again and see what changed."
+                   TUNE_CHANGED=0
+                   if assist_do "${BN_RECO[act-1]%%|*}" "$(bget port)" && (( TUNE_CHANGED )); then echo -e "\n  ${G}Done.${NC} Press ${W}r${NC} to run the test again and see what changed."
                    else echo -e "\n  ${Y}Nothing was changed${NC} ${GR}(see the message above).${NC}"; fi
                    pause
                fi ;;
@@ -2590,6 +2656,7 @@ cmd_bench() {    # pfm bench <port> [quick|full] [--peer PORT] [--inet] [--yes] 
         esac; shift
     done
     [[ "$pp" =~ ^[0-9]+$ ]] && { (( pp == 0 )) || valid_port "$pp"; } || { echo "--peer needs a port number (1-65535)"; echo "$use"; return 1; }
+    if [[ "$mode" == quick ]] && (( pp > 0 || inet )); then mode=full; echo -e "  ${GR}--peer / --inet are parts of the speed test, so this is the full test.${NC}"; fi
     ensure_tool ping "latency test" || { echo "ping is required"; return 1; }
     if (( pp > 0 )); then     # the same checks the menu makes: a missing helper must say so instead of turning a "full" report into a quick one
         bench_prepare "$port" > /dev/null || { echo -e "  ${R}Cannot start the test: tunnel not found, destination does not resolve, or no route to it.${NC}"; return 1; }
@@ -2612,7 +2679,7 @@ MODLOAD_FILE="${PFM_MODLOAD_FILE:-/etc/modules-load.d/bbr.conf}"
 PFM_ROUTE_PROTO=77         # routes the assistant creates carry this protocol number, so only they are ever removed
 
 tune_init() { mkdir -p "$TUNE_DIR"; local f; for f in history.log sysctl.orig sysctl.conf nic.conf nic.orig mss.ports misc.orig; do [[ -e "$TUNE_DIR/$f" ]] || : > "$TUNE_DIR/$f"; done; }
-tune_hist() { tune_init; echo "$(date +%s)|$1|$2" >> "$TUNE_DIR/history.log"; log "TUNE $1: $2"; }
+tune_hist() { tune_init; TUNE_CHANGED=1; echo "$(date +%s)|$1|$2" >> "$TUNE_DIR/history.log"; log "TUNE $1: $2"; }
 kv_get() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2> /dev/null; }
 kv_has() { awk -F= -v k="$2" '$1 == k { f = 1 } END { exit !f }' "$1" 2> /dev/null; }
 kv_set() {    # replaced as a whole: a kill or a full disk must never leave a half-written (empty) record of the original values
@@ -2625,6 +2692,7 @@ port_unset() { sed -i "/^$2=/d" "$PORTS_DIR/$1" 2> /dev/null; }
 
 # ── kernel tunables: original value remembered, change persisted, re-applied at boot and by sync ──
 TUNE_OK=0; TUNE_NO=0       # settings really written / refused since tune_count_reset: the closing line must tell the truth
+TUNE_CHANGED=0             # set by tune_hist: something was really changed (the Bench Test viewer says "Done" only then)
 tune_count_reset() { TUNE_OK=0; TUNE_NO=0; }
 tune_sysctl() {    # tune_sysctl <key> <value> -> 0 applied · 1 not in this kernel · 2 refused (container / read-only / no room to record the original)
     local k="$1" v="$2" cur
@@ -3950,7 +4018,7 @@ _pfm_complete() {
     else
         case "$cmd" in
             doctor) COMPREPLY=($(compgen -W "$ports" -- "$cur")) ;;
-            bench) if (( COMP_CWORD == 2 )); then COMPREPLY=($(compgen -W "$ports" -- "$cur")); else COMPREPLY=($(compgen -W "quick full --peer --yes --mask" -- "$cur")); fi ;;
+            bench) if (( COMP_CWORD == 2 )); then COMPREPLY=($(compgen -W "$ports" -- "$cur")); else COMPREPLY=($(compgen -W "quick full --peer --inet --yes --mask" -- "$cur")); fi ;;
             optimize|tune) if (( COMP_CWORD == 2 )); then COMPREPLY=($(compgen -W "quick scan status revert dns bbr nic mtu profile" -- "$cur")); else COMPREPLY=($(compgen -W "$ports gaming bandwidth balanced multiuser" -- "$cur")); fi ;;
             switch) COMPREPLY=($(compgen -W "$(cat /etc/pfm/latest.list 2> /dev/null) main --yes" -- "$cur")) ;;
         esac
